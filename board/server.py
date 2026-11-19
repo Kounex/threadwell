@@ -83,7 +83,8 @@ class Board(BaseHTTPRequestHandler):
                         row = db.execute("select seen from hosts where name=?", (result["host"],)).fetchone()
                         result["online"] = bool(row and time.time()-row[0]<100)
                 return self.send(200, json.dumps(result).encode(), "application/json")
-            files = {"/style.css": "style.css", "/board.js": "board.js", "/mark.svg":"mark.svg"}
+            files = {"/style.css": "style.css", "/board.js": "board.js", "/mark.svg":"mark.svg",
+                     "/rain.png": "rain.png", "/fonts/bitcount-latin-400.woff2": "fonts/bitcount-latin-400.woff2"}
             if path.path in files:
                 name = files[path.path]
             elif path.path in ("/", "/projects") or path.path.startswith(("/post/", "/project/")):
