@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -53,9 +54,16 @@ def answer(post):
             args = ["codex","exec","--ephemeral","--skip-git-repo-check","--sandbox","workspace-write",
                     "-c",'approval_policy="never"',"-o",str(final),"-"]
         else:
+            tools = "Read,Grep,Glob"
+            sandbox = []
+            if sys.platform == "darwin" or (shutil.which("bwrap") and shutil.which("socat")):
+                tools += ",Bash"
+                policy = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+                          "autoAllowBashIfSandboxed": True, "filesystem": {"denyWrite": [str(source)]}}
+                sandbox = ["--settings", json.dumps({"sandbox": policy})]
             args = ["claude","-p","--no-session-persistence","--permission-mode","dontAsk",
-                    "--tools","Read,Grep,Glob","--allowedTools","Read,Grep,Glob","--strict-mcp-config",
-                    "--add-dir",str(source),"--output-format","json"]
+                    "--tools",tools,"--allowedTools","Read,Grep,Glob","--strict-mcp-config",
+                    "--add-dir",str(source),"--output-format","json", *sandbox]
         with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
             stdin.write(prompt.encode())
             stdin.seek(0)

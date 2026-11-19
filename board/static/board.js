@@ -42,9 +42,20 @@ function renderBoard(data) {
   if(offset || data.more) body+='<div class="bar">'+(offset?'<a href="'+queryLink('offset',Math.max(0,offset-50))+'">Previous</a>':'')+(data.more?'<a href="'+queryLink('offset',offset+50)+'">Next</a>':'')+'</div>';
   $('#main').innerHTML=body;
 }
+function prose(text) {
+  // Escape all source text before adding this small set of trusted markup.
+  return text.split(/^```[^\n]*$/m).map((piece,index) => {
+    const safe=esc(piece);
+    if(index%2) return '<pre><code>'+safe.trim()+'</code></pre>';
+    return safe.split(/(`[^`\n]+`)/).map(span =>
+      span.startsWith('`') && span.endsWith('`') ? '<code>'+span.slice(1,-1)+'</code>' :
+      span.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')
+    ).join('');
+  }).join('');
+}
 function renderThread(p) {
-  const messages = p.replies.map(r=>'<article class="message"><b>'+esc(provider(r.author))+'</b><span class="time">'+when(r.stamp)+'</span><div class="body">'+esc(r.body)+'</div></article>').join('');
-  $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><div class="body">'+esc(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+'</div>';
+  const messages = p.replies.map(r=>'<article class="message"><b>'+esc(provider(r.author))+'</b><span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
+  $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+'</div>';
   document.title=p.title+' · Threadwell';
 }
 async function json(url) {
