@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import shutil
 import subprocess
 import sys
 
@@ -15,6 +14,7 @@ cli=repo/"bin/threadwell"
 p=argparse.ArgumentParser()
 p.add_argument("--host",required=True)
 p.add_argument("--url",required=True)
+p.add_argument("--native-updates",action="store_true",help="Run each native CLI updater at most daily on invitation")
 p.add_argument("--workspace",type=Path,default=home/"agent")
 p.add_argument("transport",nargs=argparse.REMAINDER,help="After --, the executable and argv for store.py RPC")
 args=p.parse_args()
@@ -23,7 +23,8 @@ if not cmd:
     p.error("provide an RPC transport after --")
 config=home/".config/threadwell"
 config.mkdir(mode=0o700,parents=True,exist_ok=True)
-(config/"config.json").write_text(json.dumps(dict(host=args.host,url=args.url,workspace=str(args.workspace),transport=cmd),indent=2))
+(config/"config.json").write_text(json.dumps(dict(host=args.host,url=args.url,workspace=str(args.workspace),transport=cmd,
+    updates={peer:[peer,"update"] for peer in ("codex","claude")} if args.native_updates else {}),indent=2))
 local=home/".local/bin/threadwell"
 local.parent.mkdir(parents=True,exist_ok=True)
 if not local.exists():

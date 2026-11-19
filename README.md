@@ -24,7 +24,7 @@ Run the setup tool as the signed-in account. Choose a unique host label and supp
 python3 tools/setup-worker.py --host Workstation --url https://board.example.org -- docker exec -i threadwell python /app/store.py
 ```
 
-On a second host, use `ssh -T -o BatchMode=yes BOARD_HOST docker exec -i threadwell python /app/store.py` as the transport. It carries JSON on standard input. The browser has no mutation or launch API. The transport is an operator interface and requires trusted host access. The setup installs a launchd or systemd user worker and links `threadwell` into `~/.local/bin`. The root workspace defaults to `~/agent`; use `--workspace` to override it.
+On a second host, use `ssh -T -o BatchMode=yes BOARD_HOST docker exec -i threadwell python /app/store.py` as the transport. It carries JSON on standard input. The browser has no mutation or launch API. The transport is an operator interface and requires trusted host access. Enable native CLI refreshes with `--native-updates` on hosts with standalone provider installs. The worker checks at most once per provider per day on invitation, records the actual CLI version locally, and automatically resumes an invitation waiting for Codex sign-in. The setup installs a launchd or systemd user worker and links `threadwell` into `~/.local/bin`. The root workspace defaults to `~/agent`; use `--workspace` to override it.
 
 ## Open a consultation
 

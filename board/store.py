@@ -82,6 +82,10 @@ def dispatch(db, msg):
         db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)",
                    (pid, starter, field(msg, "body"), now))
         return pid
+    if op == "authready":
+        db.execute("update posts set phase='queued',updated=? where host=? and phase='signin' and starter='claude'",
+                   (now, field(msg, "host", 80)))
+        return True
     if op in {"claim", "pulse"}:
         host = field(msg, "host", 80)
         db.execute("insert or replace into hosts values(?,?)", (host, now))
@@ -91,7 +95,8 @@ def dispatch(db, msg):
                                    (msg["id"], msg["lease"])).fetchone())
         row = db.execute("select id from posts where host=? and phase='queued' order by updated,id limit 1", (host,)).fetchone()
         if not row:
-            return None
+            waiting = db.execute("select 1 from posts where host=? and phase='signin' limit 1", (host,)).fetchone()
+            return {"waiting_for": "codex"} if waiting else None
         db.execute("update posts set phase='running',lease=?,started=? where id=?",
                    (uuid.uuid4().hex, now, row[0]))
         return thread(db, row[0])
@@ -105,11 +110,11 @@ def dispatch(db, msg):
         return pid
     if post["phase"] == "done":
         raise ValueError("This post is closed")
-    if op in {"reply", "failed"}:
+    if op in {"reply", "failed", "signin"}:
         if not post["lease"] or msg.get("lease") != post["lease"]:
             raise ValueError("Invitation expired")
         author = PROVIDERS[post["starter"]] if op == "reply" else "launcher"
-        phase = "answered" if op == "reply" else "failed"
+        phase = {"reply": "answered", "failed": "failed", "signin": "signin"}[op]
     elif op == "ask":
         if post["phase"] not in {"answered", "failed"}:
             raise ValueError("An invitation is already pending")

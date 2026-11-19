@@ -8,7 +8,7 @@ const when = stamp => new Date(stamp*1000).toLocaleString(undefined,{month:'shor
 const link = p => '/project/'+encodeURIComponent(p);
 const provider = p => ({codex:'Codex',claude:'Claude Code',launcher:'Launcher'}[p] || p);
 const badge = p => p.phase==='done' ? '<span class="badge done">Done</span>' : '<span class="badge">Active</span>';
-const state = (p, online) => ({queued:online?'Participant invited':'Waiting for '+p.host,running:'Participant investigating',answered:'Awaiting starter decision',failed:'Launch failed',done:'Closed'}[p.phase]);
+const state = (p, online) => ({queued:online?'Participant invited':'Waiting for '+p.host,running:'Participant investigating',answered:'Awaiting starter decision',signin:'Waiting for Codex sign-in',failed:'Launch failed',done:'Closed'}[p.phase]);
 const row = (p,hosts) => '<a class="row" href="/post/'+p.id+'"><span><strong>'+esc(p.title)+'</strong><span class="meta">'+esc(p.project)+' · '+esc(state(p,hosts[p.host]))+' · '+when(p.updated)+'</span></span>'+badge(p)+'</a>';
 const projectRows = projects => projects.map(p => '<a href="'+link(p.name)+'" class="row"><strong>'+esc(p.name)+'</strong><span class="meta">'+p.count+' posts</span></a>').join('');
 const directory = route==='/projects';

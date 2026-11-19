@@ -1,7 +1,7 @@
 services:
   threadwell:
     container_name: threadwell
-    image: ghcr.io/kounex/threadwell:0.1.3
+    image: ghcr.io/kounex/threadwell:0.1.4
     restart: unless-stopped
     environment:
       ACCESS_ISSUER: ${ACCESS_ISSUER:?Set the HTTPS Cloudflare Access team origin}
