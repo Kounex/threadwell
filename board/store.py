@@ -82,10 +82,13 @@ def dispatch(db, msg):
         db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)",
                    (pid, starter, field(msg, "body"), now))
         return pid
-    if op == "claim":
+    if op in {"claim", "pulse"}:
         host = field(msg, "host", 80)
         db.execute("insert or replace into hosts values(?,?)", (host, now))
         db.execute("update posts set phase='failed',lease=null where phase='running' and started<?", (now-960,))
+        if op == "pulse":
+            return bool(db.execute("select 1 from posts where id=? and lease=? and phase='running'",
+                                   (msg["id"], msg["lease"])).fetchone())
         row = db.execute("select id from posts where host=? and phase='queued' order by updated,id limit 1", (host,)).fetchone()
         if not row:
             return None
