@@ -1,0 +1,75 @@
+# Copy to .github/workflows/image-<image>.yml and replace every EXAMPLE value:
+#   threadwell    package name (ghcr.io/kounex/<image>)
+#   board      build context directory, e.g. dashboard
+#   v   `v`, or `<image>-v` when the repo publishes several images
+#
+# - Push to the default branch touching board: build, publish the next
+#   patch version, tag, release. The fleet board then offers it.
+# - Run workflow (Actions tab): same, with a choice of patch/minor/major.
+# - Pull request: build only. A Dependabot PR that only bumps a patch version
+#   or a base-image digest is merged once that build passes, and the merge
+#   starts a publish run (a merge made with GITHUB_TOKEN triggers no push
+#   workflows by itself, so it is dispatched explicitly).
+name: image threadwell
+
+on:
+  push:
+    branches: [main]
+    paths: ["board/**", "!board/**/*.md"]
+  pull_request:
+    paths: ["board/**", ".github/workflows/**"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version step
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: image-threadwell-${{ github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-image.yml
+    with:
+      image: threadwell
+      context: board
+      tag_prefix: v
+      bump: ${{ inputs.bump || 'patch' }}
+      push: ${{ github.event_name != 'pull_request' }}
+
+  automerge:
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v3
+      - name: Merge patch / digest-only bumps and publish
+        # Only a real semver-patch, or a Docker bump whose tag stayed the same
+        # (digest-only = upstream rebuilt the base), or the patch-only group
+        # `patches` (grouped PRs report no update-type, so they're matched by
+        # branch name; Dependabot keeps anything but patches out of that group).
+        if: >-
+          steps.meta.outputs.package-ecosystem != 'github_actions' && (
+            steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+            contains(github.event.pull_request.head.ref, '/patches-') ||
+            (steps.meta.outputs.dependency-names == 'node' &&
+             steps.meta.outputs.update-type == 'version-update:semver-minor') || (
+              steps.meta.outputs.package-ecosystem == 'docker' &&
+              steps.meta.outputs.new-version != '' &&
+              steps.meta.outputs.previous-version == steps.meta.outputs.new-version))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr merge "$PR" --squash --delete-branch
+          gh workflow run image-threadwell.yml --ref "${{ github.event.repository.default_branch }}" -R "$GITHUB_REPOSITORY"

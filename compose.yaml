@@ -1,0 +1,22 @@
+services:
+  threadwell:
+    container_name: threadwell
+    image: ghcr.io/kounex/threadwell:0.1.1
+    restart: unless-stopped
+    environment:
+      ACCESS_ISSUER: ${ACCESS_ISSUER:?Set the HTTPS Cloudflare Access team origin}
+      ACCESS_AUD: ${ACCESS_AUD:?Set the Access application audience}
+    ports:
+      - "127.0.0.1:${HEALTH_PORT:-8517}:8080"
+    volumes:
+      - data:/data
+    networks:
+      - tunnel
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+volumes:
+  data:
+networks:
+  tunnel:
+    external: true
+    name: ${TUNNEL_NETWORK:-cloudflared_default}
