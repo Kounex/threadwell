@@ -64,7 +64,9 @@ button { cursor: pointer; color: var(--green); }
 button:hover { background: #203428; }
 main { max-width: 1220px; padding: 32px clamp(20px,4vw,68px) 72px; }
 .masthead { isolation: isolate; position: relative; display: flex; align-items: center; overflow: hidden; min-height: 136px; padding: 16px 0; border-block: 1px solid var(--line); background: #0c1710; }
-.masthead::before { content: ""; position: absolute; z-index: -1; inset: 0 0 0 auto; width: min(53%,530px); background: url("/rain.png") repeat-x right top / auto 100%; image-rendering: pixelated; mask-image: linear-gradient(90deg, transparent,#000 42%); }
+.masthead::before { content: ""; position: absolute; z-index: -1; inset: -100% 0 0 auto; width: min(53%,530px); background: url("/rain.png") repeat right top / auto 50%; image-rendering: pixelated; mask-image: linear-gradient(90deg, transparent,#000 42%); animation: rain 40s steps(136) infinite; will-change: transform; }
+/* The layer is two tiles tall; moving it down by one tile (50% of itself) loops seamlessly at any header height. One step per header pixel keeps the glyphs crisp. */
+@keyframes rain { to { transform: translateY(50%); } }
 .masthead::after { content: ""; position: absolute; left: 0; bottom: 0; height: 3px; width: 44px; background: var(--green); }
 .masthead h1 { margin: 0; padding: 0 20px; max-width: 70%; color: var(--green); font: 400 clamp(38px,4.3vw,68px)/1.04 var(--display); letter-spacing: -.025em; overflow-wrap: anywhere; }
 .masthead + form { margin: 20px 0; }
@@ -119,7 +121,7 @@ h2 { font: 600 18px/1.4 var(--mono); margin: 29px 0 12px; letter-spacing: -.045e
   main { padding: 20px 16px 48px; }
   .masthead { min-height: 106px; }
   .masthead h1 { max-width: 80%; padding-left: 12px; }
-  .masthead::before { width: 39%; mask-image: linear-gradient(90deg,transparent,#000 84%); }
+  .masthead::before { width: 39%; mask-image: linear-gradient(90deg,transparent,#000 84%); animation-timing-function: steps(106); }
   .row { gap: 8px; padding: 17px 0 17px 24px; }
   .row::before { left: 0; top: 23px; width: 12px; height: 12px; }
   .row strong { font-size: 16px; }
@@ -129,4 +131,7 @@ h2 { font: 600 18px/1.4 var(--mono); margin: 29px 0 12px; letter-spacing: -.045e
   aside { padding-inline: 10px; }
   .brand { font-size: 22px; }
   nav a { font-size: 12px; padding-inline: 5px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .masthead::before { animation: none; }
 }
