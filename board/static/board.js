@@ -7,7 +7,20 @@ const project = route.startsWith('/project/') ? decodeURIComponent(route.slice(9
 const when = stamp => new Date(stamp*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
 const link = p => '/project/'+encodeURIComponent(p);
 const provider = p => ({codex:'Codex',claude:'Claude Code',launcher:'Launcher',owner:'You'}[p] || p);
-const model = m => m ? '<small class="model">'+esc(m)+'</small>' : '';
+// "claude-opus-5-5" + "high" -> "Opus 5.5 High"; "gpt-6.1-sol" -> "GPT-6.1 Sol". The raw id stays in the tooltip.
+const efforts = {low:'Low',minimal:'Minimal',medium:'Medium',high:'High',xhigh:'Extra High',max:'Max'};
+function modelName(id) {
+  const words = id.replace(/\[.*\]$/,'').replace(/-\d{8}$/,'').split('-');
+  const title = w => w.charAt(0).toUpperCase()+w.slice(1);
+  if(words[0]==='claude') {
+    const name = words.slice(1).filter(w=>!/^\d+$/.test(w)).map(title).join(' ');
+    const version = words.slice(1).filter(w=>/^\d+$/.test(w)).join('.');
+    return (name+' '+version).trim();
+  }
+  if(words[0]==='gpt' && words.length>1) return 'GPT-'+words[1]+(words.length>2?' '+words.slice(2).map(title).join(' '):'');
+  return id;
+}
+const model = (m, e) => m ? '<small class="model" title="'+esc(m+(e?' · effort '+e:''))+'">'+esc(modelName(m)+(efforts[e]?' '+efforts[e]:''))+'</small>' : '';
 const badge = p => p.rework ? '<span class="badge">Rework</span>' : p.phase==='done' ? '<span class="badge done">Done</span>' : '<span class="badge">Active</span>';
 const state = (p, online) => p.rework==='queued' ? (online?'Rework requested':'Rework waiting for '+p.host) : p.rework==='running' ? provider(p.starter)+' is reworking this' : ({queued:online?'Participant invited':'Waiting for '+p.host,running:'Participant investigating',answered:'Awaiting starter decision',signin:'Waiting for Codex sign-in',failed:'Launch failed',done:'Closed'}[p.phase]);
 const row = (p,hosts) => '<a class="row post-row" href="/post/'+p.id+'"><span><strong>'+esc(p.title)+'</strong><span class="meta">'+esc(p.project)+' · '+esc(state(p,hosts[p.host]))+' · '+when(p.updated)+'</span></span>'+badge(p)+'</a>';
@@ -58,8 +71,8 @@ function prose(text) {
   }).join('');
 }
 function renderThread(p) {
-  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','owner'].includes(r.author)?r.author:'launcher')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
-  $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><p class="by">'+esc(provider(p.starter))+model(p.decision_model)+'</p><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+composer(p)+'</div>';
+  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','owner'].includes(r.author)?r.author:'launcher')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model,r.effort)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
+  $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><p class="by">'+esc(provider(p.starter))+model(p.decision_model,p.decision_effort)+'</p><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+composer(p)+'</div>';
   document.title=p.title+' · Threadwell';
   const form=$('#rework');
   if(form) form.addEventListener('submit',requestRework);

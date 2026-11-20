@@ -16,10 +16,10 @@ CREATE TABLE IF NOT EXISTS posts(
  id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(name),
  title TEXT NOT NULL, starter TEXT NOT NULL, host TEXT NOT NULL,
  phase TEXT NOT NULL, updated INTEGER NOT NULL, decision TEXT NOT NULL DEFAULT '',
- lease TEXT, started INTEGER, decision_model TEXT,
+ lease TEXT, started INTEGER, decision_model TEXT, decision_effort TEXT,
  rework TEXT, rework_lease TEXT, rework_seen INTEGER);
 CREATE TABLE IF NOT EXISTS replies(
- seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER, model TEXT, kind TEXT);
+ seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER, model TEXT, kind TEXT, effort TEXT);
 CREATE INDEX IF NOT EXISTS reply_post ON replies(post,seq);
 CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, seen INTEGER);
 """
@@ -37,8 +37,8 @@ def initialize():
         db.execute("pragma journal_mode=wal")
         db.executescript(SCHEMA)
         # Columns added after the first release; CREATE TABLE IF NOT EXISTS leaves existing tables alone.
-        added = (("posts", "decision_model"), ("posts", "rework"), ("posts", "rework_lease"), ("posts", "rework_seen"),
-                 ("replies", "model"), ("replies", "kind"))
+        added = (("posts", "decision_model"), ("posts", "decision_effort"), ("posts", "rework"), ("posts", "rework_lease"),
+                 ("posts", "rework_seen"), ("replies", "model"), ("replies", "kind"), ("replies", "effort"))
         for table, column in added:
             if column not in {r[1] for r in db.execute(f"pragma table_info({table})")}:
                 db.execute(f"alter table {table} add column {column} TEXT")
@@ -50,7 +50,7 @@ def thread(db, pid):
         raise ValueError("Post not found")
     result = dict(row)
     result["replies"] = [dict(r) for r in db.execute(
-        "select author,body,stamp,model,kind from replies where post=? order by seq", (pid,))]
+        "select author,body,stamp,model,effort,kind from replies where post=? order by seq", (pid,))]
     return result
 
 
@@ -61,12 +61,16 @@ def field(msg, key, limit=64000):
     return value.strip()
 
 
-def model(msg):
-    """Optional model identifier reported by the CLI that wrote a message."""
-    value = msg.get("model")
-    if not isinstance(value, str) or not re.fullmatch(r"[\w.:/@\[\]-]{1,80}", value.strip()):
+def model(msg, key="model", pattern=r"[\w.:/@\[\]-]{1,80}"):
+    """Optional model identifier (or effort level) reported by the CLI that wrote a message."""
+    value = msg.get(key)
+    if not isinstance(value, str) or not re.fullmatch(pattern, value.strip()):
         return None
     return value.strip()
+
+
+def effort(msg):
+    return model(msg, "effort", r"[a-z]{1,16}")
 
 
 def finish_rework(db, pid, now, note):
@@ -103,8 +107,8 @@ def dispatch(db, msg):
         name = project(db, field(msg, "project", 80))
         db.execute("insert into posts(id,project,title,starter,host,phase,updated) values(?,?,?,?,?,'queued',?)",
                    (pid, name, field(msg, "title", 200), starter, field(msg, "host", 80), now))
-        db.execute("insert into replies(post,author,body,stamp,model) values(?,?,?,?,?)",
-                   (pid, starter, field(msg, "body"), now, model(msg)))
+        db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
+                   (pid, starter, field(msg, "body"), now, model(msg), effort(msg)))
         return pid
     if op == "authready":
         db.execute("update posts set phase='queued',updated=? where host=? and phase='signin' and starter='claude'",
@@ -157,8 +161,8 @@ def dispatch(db, msg):
         kept = [r["body"] for r in post["replies"] if r["kind"] == "decision"]
         if post["decision"] and kept[-1:] != [post["decision"]]:
             # Keep the decision being questioned in the thread; a new close replaces posts.decision.
-            db.execute("insert into replies(post,author,body,stamp,model,kind) values(?,?,?,?,?,'decision')",
-                       (pid, post["starter"], post["decision"], post["updated"], post["decision_model"]))
+            db.execute("insert into replies(post,author,body,stamp,model,effort,kind) values(?,?,?,?,?,?,'decision')",
+                       (pid, post["starter"], post["decision"], post["updated"], post["decision_model"], post["decision_effort"]))
         db.execute("insert into replies(post,author,body,stamp,kind) values(?,'owner',?,?,'rework')", (pid, body, now))
         db.execute("update posts set phase='answered',rework='queued',updated=? where id=?", (now, pid))
         return pid
@@ -177,18 +181,22 @@ def dispatch(db, msg):
             raise ValueError("An invitation is already pending")
         author, phase = post["starter"], "queued"
     elif op == "close":
-        db.execute("update posts set phase='done',updated=?,lease=null,decision=?,decision_model=? where id=?",
-                   (now, field(msg, "body"), model(msg), pid))
+        db.execute("update posts set phase='done',updated=?,lease=null,decision=?,decision_model=?,decision_effort=? where id=?",
+                   (now, field(msg, "body"), model(msg), effort(msg), pid))
         return pid
     else:
         raise ValueError("Unknown command")
-    db.execute("insert into replies(post,author,body,stamp,model) values(?,?,?,?,?)",
-               (pid, author, field(msg, "body"), now, model(msg) if author != "launcher" else None))
+    agent = author != "launcher"
+    db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
+               (pid, author, field(msg, "body"), now, model(msg) if agent else None, effort(msg) if agent else None))
     db.execute("update posts set updated=?,phase=?,lease=null where id=?", (now, phase, pid))
     return pid
 
 
 if __name__ == "__main__":
+    request = json.load(sys.stdin)
+    if request.get("op") == "rework":
+        sys.exit("Rework requests come from the owner on the board")
     with connect() as connection:
-        result = dispatch(connection, json.load(sys.stdin))
+        result = dispatch(connection, request)
     print(json.dumps(result))

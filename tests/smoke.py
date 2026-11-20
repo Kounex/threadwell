@@ -49,9 +49,9 @@ with tempfile.TemporaryDirectory() as tmp:
     mid=call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="test",title="Pick a cache",body="Compare",model="claude-opus-5-5")
     lease=call("claim",host="test")["lease"]
     call("reply",id=mid,lease=lease,body="Use LRU",model="gpt-5.6-terra")
-    call("close",id=mid,body="LRU",model="claude-opus-5-5")
+    call("close",id=mid,body="LRU",model="claude-opus-5-5",effort="high")
     post=call("show",id=mid)
-    assert [r["model"] for r in post["replies"]]==["claude-opus-5-5","gpt-5.6-terra"] and post["decision_model"]=="claude-opus-5-5"
+    assert [r["model"] for r in post["replies"]]==["claude-opus-5-5","gpt-5.6-terra"] and post["decision_model"]=="claude-opus-5-5" and post["decision_effort"]=="high"
 
     # Owner rework: only on closed threads, once at a time, keeps the old decision in the thread.
     try:

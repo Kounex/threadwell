@@ -45,35 +45,53 @@ def last_model(path, pick):
     return found
 
 
+def claude_log(session):
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home()/".claude")/"projects"
+    logs = sorted(base.glob("*/"+session+".jsonl")) if session else []
+    return logs[-1] if logs else None
+
+
+def claude_log_model(path):
+    """(model, effort) of the last main-thread assistant turn in a Claude Code session log."""
+    pick = lambda d: d.get("type") == "assistant" and not d.get("isSidechain") and \
+        d["message"].get("model") not in (None, "<synthetic>") and (d["message"]["model"], d.get("effort"))
+    return last_model(path, pick) or (None, None)
+
+
 def session_model(provider):
-    """Model of the calling agent session, read from that CLI's own session log."""
-    if provider == "claude" and os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home()/".claude")/"projects"
-        logs = sorted(base.glob("*/"+os.environ["CLAUDE_CODE_SESSION_ID"]+".jsonl"))
-        pick = lambda d: d.get("type") == "assistant" and not d.get("isSidechain") and \
-            (d["message"].get("model") if d["message"].get("model") != "<synthetic>" else None)
-        return last_model(logs[-1], pick) if logs else None
+    """(model, effort) of the calling agent session, read from that CLI's own session log."""
+    if provider == "claude":
+        path = claude_log(os.environ.get("CLAUDE_CODE_SESSION_ID"))
+        return claude_log_model(path) if path else (None, None)
     if provider == "codex" and os.environ.get("CODEX_THREAD_ID"):
         base = Path(os.environ.get("CODEX_HOME") or Path.home()/".codex")/"sessions"
         logs = sorted(base.rglob("rollout-*-"+os.environ["CODEX_THREAD_ID"]+".jsonl"))
-        pick = lambda d: d.get("type") == "turn_context" and d["payload"].get("model")
-        return last_model(logs[-1], pick) if logs else None
-    return None
+        pick = lambda d: d.get("type") == "turn_context" and d["payload"].get("model") and \
+            (d["payload"]["model"], d["payload"].get("effort"))
+        return (last_model(logs[-1], pick) if logs else None) or (None, None)
+    return None, None
 
 
 def codex_banner_model(stderr):
-    # `codex exec` prints its settings between two dashed lines before echoing the prompt.
+    """(model, effort) from the settings `codex exec` prints between two dashed lines before echoing the prompt."""
     parts = stderr.split("\n--------\n")
-    header = parts[1] if len(parts) > 2 else ""
-    for line in header.splitlines():
-        if line.startswith("model: "):
-            return line[7:].strip()
-    return None
+    header = dict(line.split(": ", 1) for line in (parts[1] if len(parts) > 2 else "").splitlines() if ": " in line)
+    return header.get("model", "").strip() or None, header.get("reasoning effort", "").strip() or None
 
 
-def claude_result_model(response):
+def claude_result_model(response, forget=False):
+    """(model, effort): the model from the result, the effort from the run's session log (removed when forget)."""
     usage = response.get("modelUsage") or {}
-    return max(usage, key=lambda m: usage[m].get("outputTokens", 0)) if usage else None
+    used = max(usage, key=lambda m: usage[m].get("outputTokens", 0)) if usage else None
+    path = claude_log(response.get("session_id"))
+    level = claude_log_model(path)[1] if path else None
+    if path and forget:
+        path.unlink(missing_ok=True)
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
+    return used, level
 
 
 def codex_signed_in():
@@ -140,7 +158,8 @@ def answer(post):
                 policy = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
                           "autoAllowBashIfSandboxed": True, "filesystem": {"denyWrite": [str(source)]}}
                 sandbox = ["--settings", json.dumps({"sandbox": policy})]
-            args = ["claude","-p","--no-session-persistence","--permission-mode","dontAsk",
+            # The session log is kept only long enough to read the effort level, then removed.
+            args = ["claude","-p","--permission-mode","dontAsk",
                     "--tools",tools,"--allowedTools","Read,Grep,Glob","--strict-mcp-config",
                     "--add-dir",str(source),"--output-format","json", *sandbox]
         alive = lambda: rpc("pulse", host=CFG["host"], id=pid, lease=lease)
@@ -155,13 +174,13 @@ def answer(post):
             print(err[-1500:], file=sys.stderr, flush=True)
             raise RuntimeError(f"{peer} exited with status {code}. Check the host launcher log and CLI login.")
         if peer == "codex":
-            result, used = final.read_text(), codex_banner_model(err)
+            result, (used, level) = final.read_text(), codex_banner_model(err)
         else:
             response = json.loads(out)
             if response.get("is_error"):
                 raise RuntimeError("Claude Code reported an error. Check its login and account access.")
-            result, used = response["result"], claude_result_model(response)
-    rpc("reply",id=pid,lease=lease,body=result.strip()[:64000],model=used)
+            result, (used, level) = response["result"], claude_result_model(response, forget=True)
+    rpc("reply",id=pid,lease=lease,body=result.strip()[:64000],model=used,effort=level)
 
 
 def run_cli(args, prompt, cwd, env, deadline, alive):
@@ -205,11 +224,28 @@ def checkout_problem(source):
     return None
 
 
+def retry(call, attempts=6):
+    for attempt in range(attempts):
+        try:
+            return call()
+        except Exception:
+            if attempt == attempts-1:
+                raise
+            time.sleep(20)
+
+
 def rework(pid, lease):
     """One unattended starter session for an owner's rework request. Runs detached from the worker."""
     post = rpc("show", id=pid)
     starter, settings = post["starter"], CFG.get("rework") or {}
-    alive = lambda: rpc("reworkpulse", id=pid, lease=lease)
+
+    def alive():
+        # A board redeploy briefly breaks the transport; only an explicit "lease gone" stops the run.
+        try:
+            return rpc("reworkpulse", id=pid, lease=lease)
+        except Exception as exc:
+            print(f"Rework {pid}: pulse failed: {exc}", file=sys.stderr, flush=True)
+            return True
     outcome, title = None, "Threadwell rework failed"
     try:
         context = LOCAL/(pid+".json")
@@ -244,19 +280,19 @@ def rework(pid, lease):
                 print(err[-1500:], file=sys.stderr, flush=True)
                 raise RuntimeError(f"{starter} exited with status {code}. Check the host launcher log.")
             if starter == "codex":
-                result, used = (final.read_text() if final.exists() else ""), codex_banner_model(err)
+                result, (used, _) = (final.read_text() if final.exists() else ""), codex_banner_model(err)
             else:
                 response = json.loads(out)
                 if response.get("is_error"):
                     raise RuntimeError("Claude Code reported an error. Check its login and account access.")
-                result, used = response.get("result", ""), claude_result_model(response)
-        closed = rpc("show", id=pid)["phase"] == "done"
+                result, used = response.get("result", ""), claude_result_model(response)[0]
+        closed = retry(lambda: rpc("show", id=pid))["phase"] == "done"
         title = "Threadwell rework finished" if closed else "Threadwell rework ended without a decision"
         outcome = None if closed else ("The rework run ended without closing the thread, so the previous decision stands. "
                                        f"Its last output ({used or starter}):\n\n{result.strip()}")
     except Exception as exc:
         outcome = f"Rework run on {CFG['host']} failed: {str(exc)[:1500]}. The previous decision stands."
-    rpc("reworked", id=pid, lease=lease, body=outcome)
+    retry(lambda: rpc("reworked", id=pid, lease=lease, body=outcome))
     notify = CFG.get("notify")
     if notify:
         subprocess.run([*notify, f"{post['title']}\n{url(pid)}", title], capture_output=True, timeout=30)
@@ -268,10 +304,15 @@ def start_rework(post):
             body=f"Rework runs are not enabled on {CFG['host']} (see the Threadwell README). The previous decision stands.")
         return
     LOCAL.mkdir(mode=0o700, parents=True, exist_ok=True)
+    command = [sys.executable, str(Path(__file__).resolve()), "rework-run", post["id"], post["rework_lease"]]
+    if os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
+        # Under systemd the worker's cgroup would take the run down with it; give it its own transient unit.
+        keep = [k for k in os.environ if k == "PATH" or k.startswith("THREADWELL_") or k in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")]
+        command = ["systemd-run", "--user", "--collect", "--quiet", "--unit", "threadwell-rework-"+post["id"][:8],
+                   *[f"--setenv={k}={os.environ[k]}" for k in keep], *command]
     with open(LOCAL/"rework.log", "a") as log:
-        # Own session so a worker restart neither kills the run nor starts a duplicate; the run pulses its own lease.
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "rework-run", post["id"], post["rework_lease"]],
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        # Detached so a worker restart neither kills the run nor starts a duplicate; the run pulses its own lease.
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
 def worker():
@@ -297,6 +338,11 @@ def worker():
         time.sleep(8)
 
 
+def detected(args, provider):
+    used, level = session_model(provider)
+    return {"model": args.model or used, "effort": args.effort or (level if not args.model or args.model == used else None)}
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     commands=parser.add_subparsers(dest="command",required=True)
@@ -306,12 +352,14 @@ def main():
     start.add_argument("--title",required=True)
     start.add_argument("--body",help="Defaults to standard input")
     start.add_argument("--model",help="Shown next to the name; detected from the Claude Code or Codex session when omitted")
+    start.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
     for name in ("show","wait","ask","close","move"):
         sub=commands.add_parser(name)
         sub.add_argument("id")
         if name in ("ask","close"):
             sub.add_argument("--body",help="Defaults to standard input")
             sub.add_argument("--model",help="Shown next to the name; detected from the session when omitted")
+            sub.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
         if name=="move":
             sub.add_argument("project")
         if name=="wait":
@@ -334,7 +382,7 @@ def main():
         name=args.project or (source.relative_to(workspace).parts[0] if workspace in source.parents else "General")
         (LOCAL/(pid+".json")).write_text(json.dumps({"directory":str(source)}))
         rpc("open",id=pid,host=CFG["host"],starter=args.starter,project=name,title=args.title,body=args.body or sys.stdin.read(),
-            model=args.model or session_model(args.starter))
+            **detected(args, args.starter))
         print(url(pid))
     elif args.command=="wait":
         deadline=time.monotonic()+args.timeout
@@ -350,8 +398,7 @@ def main():
         print(url(rpc("move",id=args.id,project=args.project)))
     else:
         body=args.body or sys.stdin.read()
-        used=args.model or session_model(rpc("show",id=args.id)["starter"])
-        print(url(rpc(args.command,id=args.id,body=body,model=used)))
+        print(url(rpc(args.command,id=args.id,body=body,**detected(args, rpc("show",id=args.id)["starter"]))))
 
 
 if __name__=="__main__":

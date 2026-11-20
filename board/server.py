@@ -73,19 +73,20 @@ class Board(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlsplit(self.path).path
         parts = path.split("/")
+        refuse = lambda code, text: self.send(code, json.dumps({"error": text}).encode(), "application/json")
         if len(parts) != 5 or parts[:3] != ["", "api", "post"] or parts[4] != "rework":
-            return self.send(404, b"Not found", "text/plain")
+            return refuse(404, "Not found")
         claims = self.identity()
         if claims is None:
-            return self.send(403, b"Owner sign-in required", "text/plain")
+            return refuse(403, "Owner sign-in required. Reload the page to sign in again.")
         if not LOCAL and str(claims.get("email", "")).lower() not in OWNERS:
-            return self.send(403, b"Rework requests are limited to the board owner", "text/plain")
+            return refuse(403, "Rework requests are limited to the board owner (ACCESS_OWNER).")
         # Ambient Access cookies make this CSRF-relevant: same-origin JSON only, fail closed.
         scheme = "http" if LOCAL else "https"
         if self.headers.get("Origin") != f"{scheme}://{self.headers.get('Host', '')}" or \
                 self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin" or \
                 self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
-            return self.send(403, b"Cross-site request refused", "text/plain")
+            return refuse(403, f"Cross-site request refused (Origin {self.headers.get('Origin')!r}, Host {self.headers.get('Host')!r}).")
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 40000:
@@ -94,7 +95,7 @@ class Board(BaseHTTPRequestHandler):
             with connect() as db:
                 dispatch(db, {"op": "rework", "id": parts[3], "body": body})
         except (ValueError, AttributeError, KeyError) as error:
-            return self.send(409, json.dumps({"error": str(error)}).encode(), "application/json")
+            return refuse(409, str(error))
         self.send(200, b'{"ok":true}', "application/json")
 
     def do_GET(self):
