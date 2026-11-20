@@ -33,6 +33,87 @@ function queryLink(key,value) {
   if(value) next.set(key,value); else next.delete(key);
   return '?'+esc(next.toString());
 }
+// Masthead digital rain. Glyphs are rain.png's 5x7 pixel font (plus mirror images), 2px per pixel on its
+// 16px column / 18px row grid. One canvas lives across re-renders so the rain never restarts.
+const rain = (() => {
+  const font = '0e11131519110e,1f010204080808,1f010102041800,04041f04040810,01010204081000,041f041f040202,040c040404040e,1f010506040810,0102040c140404,081f0909091102,0e11010e10101f,041f1101020408,101f111210100f,1e01010e01011e,1c04040404041f,1f0102040a1100,0404040a0a1100,041f0404081000';
+  const flip = r => [0,1,2,3,4].reduce((m,b)=>m|((r>>b&1)<<(4-b)),0);
+  const glyphs = font.split(',').flatMap(hex => {
+    const rows = hex.match(/../g).map(h=>parseInt(h,16)), mirror = rows.map(flip);
+    return rows.join()===mirror.join() ? [rows] : [rows, mirror];
+  });
+  // Lead glyph, then the PNG's three greens from bright to dim.
+  const tones = ['#c4ffc6','#91f69a','#70f28a','#53ba72'];
+  const W = 16, H = 18, still = matchMedia('(prefers-reduced-motion: reduce)');
+  const canvas = document.createElement('canvas'), ctx = canvas.getContext('2d');
+  canvas.className = 'rain'; canvas.setAttribute('aria-hidden','true');
+  const atlas = document.createElement('canvas'), a = atlas.getContext('2d');
+  atlas.width = glyphs.length*W; atlas.height = tones.length*H;
+  tones.forEach((tone,t) => { a.fillStyle = tone; glyphs.forEach((rows,g) => rows.forEach((bits,y) => {
+    for(let x=0;x<5;x++) if(bits>>(4-x)&1) a.fillRect(g*W+x*2, t*H+y*2, 2, 2);
+  })); });
+  const pick = () => Math.random()*glyphs.length|0;
+  let columns = [], rowCount = 0, frame = 0, last = 0;
+  // A drop: its lead falls one cell at a time, slowly, and the short trail it leaves fades out behind it.
+  // About 40% of columns are falling at any moment; the rest wait a random while before the next drop.
+  function drop(column, fresh) {
+    column.speed = 0.6+Math.random()*0.9;   // cells per second
+    column.trail = 4+Math.random()*4|0;
+    const span = rowCount+column.trail;
+    column.head = fresh ? span-Math.random()*span*2.5 : -Math.random()*span*3;
+    column.lead = Math.floor(column.head);
+    column.cells = Array.from({length:rowCount}, pick);
+  }
+  function resize() {
+    const w = Math.round(canvas.clientWidth), h = Math.round(canvas.clientHeight);
+    if(!w || !h || (w===canvas.width && h===canvas.height)) return;
+    canvas.width = w; canvas.height = h; rowCount = Math.ceil(h/H);
+    columns = Array.from({length:Math.ceil(w/W)}, () => { const c = {}; drop(c, true); return c; });
+    draw();
+  }
+  function draw() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    columns.forEach((c,i) => {
+      const lead = Math.floor(c.head), x = canvas.width-(i+1)*W+3;   // columns hug the right edge, like rain.png
+      for(let k=0;k<c.trail;k++) {
+        const row = lead-k;
+        if(row<0 || row>=rowCount) continue;
+        const fade = k/c.trail, tone = k ? 1+Math.min(2,fade*3|0) : 0;
+        ctx.globalAlpha = k ? 0.6*(1-fade)+0.12 : 0.72;
+        ctx.drawImage(atlas, c.cells[row]*W, tone*H, W, H, x, row*H+2, W, H);
+      }
+    });
+    ctx.globalAlpha = 1;
+  }
+  function tick(now) {
+    if(!canvas.isConnected || still.matches) { frame = 0; return; }
+    frame = requestAnimationFrame(tick);
+    if(now-last < 80) return;
+    const dt = Math.min(0.25,(now-last)/1000||0); last = now;
+    for(const c of columns) {
+      c.head += c.speed*dt;
+      // Glyphs change only where the drop is: a new one at each step, now and then the one just behind it.
+      if(Math.floor(c.head)!==c.lead) {
+        c.lead = Math.floor(c.head);
+        if(c.lead>=0 && c.lead<rowCount) c.cells[c.lead] = pick();
+        if(c.lead>0 && c.lead<=rowCount && Math.random()<0.2) c.cells[c.lead-1] = pick();
+      }
+      if(c.head-c.trail > rowCount) drop(c, false);
+    }
+    draw();
+  }
+  new ResizeObserver(resize).observe(canvas);
+  still.addEventListener('change', () => attach($('.masthead')));
+  document.addEventListener('visibilitychange', () => { last = performance.now(); });
+  // Called after every render: move the one canvas into the new masthead and keep it falling.
+  function attach(host) {
+    if(!host || still.matches) { canvas.remove(); return; }
+    if(canvas.parentNode!==host) host.prepend(canvas);
+    resize();
+    if(!frame) { last = performance.now(); frame = requestAnimationFrame(tick); }
+  }
+  return {attach};
+})();
 function masthead(title) {
   return '<div class="masthead"><h1>'+esc(title)+'</h1></div>';
 }
@@ -113,8 +194,7 @@ async function update() {
     const next=JSON.stringify(item);
     if(next!==signature && !($('#main').contains(document.activeElement)&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName))){
       if(postId) renderThread(item); else renderBoard(item);
-      // A re-render recreates the masthead; offset its 40s rain loop by wall clock so it never jumps back.
-      $('.masthead')?.style.setProperty('--rain-t','-'+(Date.now()%40000)+'ms');
+      rain.attach($('.masthead'));
       signature=next;
     }
   } catch(err) { if(!signature) $('#main').textContent=err.message; else $('#hosts').textContent='Reconnecting…'; }
