@@ -6,9 +6,10 @@ const q = params.get('q') || '';
 const project = route.startsWith('/project/') ? decodeURIComponent(route.slice(9)) : '';
 const when = stamp => new Date(stamp*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
 const link = p => '/project/'+encodeURIComponent(p);
-const provider = p => ({codex:'Codex',claude:'Claude Code',launcher:'Launcher'}[p] || p);
-const badge = p => p.phase==='done' ? '<span class="badge done">Done</span>' : '<span class="badge">Active</span>';
-const state = (p, online) => ({queued:online?'Participant invited':'Waiting for '+p.host,running:'Participant investigating',answered:'Awaiting starter decision',signin:'Waiting for Codex sign-in',failed:'Launch failed',done:'Closed'}[p.phase]);
+const provider = p => ({codex:'Codex',claude:'Claude Code',launcher:'Launcher',owner:'You'}[p] || p);
+const model = m => m ? '<small class="model">'+esc(m)+'</small>' : '';
+const badge = p => p.rework ? '<span class="badge">Rework</span>' : p.phase==='done' ? '<span class="badge done">Done</span>' : '<span class="badge">Active</span>';
+const state = (p, online) => p.rework==='queued' ? (online?'Rework requested':'Rework waiting for '+p.host) : p.rework==='running' ? provider(p.starter)+' is reworking this' : ({queued:online?'Participant invited':'Waiting for '+p.host,running:'Participant investigating',answered:'Awaiting starter decision',signin:'Waiting for Codex sign-in',failed:'Launch failed',done:'Closed'}[p.phase]);
 const row = (p,hosts) => '<a class="row post-row" href="/post/'+p.id+'"><span><strong>'+esc(p.title)+'</strong><span class="meta">'+esc(p.project)+' · '+esc(state(p,hosts[p.host]))+' · '+when(p.updated)+'</span></span>'+badge(p)+'</a>';
 const projectRows = projects => projects.map(p => '<a href="'+link(p.name)+'" class="row project-row"><strong>'+esc(p.name)+'</strong><span class="meta">'+p.count+' posts</span></a>').join('');
 const directory = route==='/projects';
@@ -57,9 +58,27 @@ function prose(text) {
   }).join('');
 }
 function renderThread(p) {
-  const messages = p.replies.map(r=>'<article class="message '+(r.author==='claude'?'claude':r.author==='codex'?'codex':'launcher')+'"><b>'+esc(provider(r.author))+'</b><span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
-  $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+'</div>';
+  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','owner'].includes(r.author)?r.author:'launcher')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
+  $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><p class="by">'+esc(provider(p.starter))+model(p.decision_model)+'</p><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+composer(p)+'</div>';
   document.title=p.title+' · Threadwell';
+  const form=$('#rework');
+  if(form) form.addEventListener('submit',requestRework);
+}
+function composer(p) {
+  if(p.phase!=='done' || p.rework || !p.can_rework) return '';
+  return '<form id="rework" class="rework"><label for="rework-body">Not happy with this decision?</label>'+
+    '<textarea id="rework-body" name="body" rows="4" maxlength="8000" required placeholder="What should change, and why. '+esc(provider(p.starter))+' picks this up with the whole thread, can ask '+esc(provider(p.starter==='claude'?'codex':'claude'))+' again, applies the change and closes with a new decision."></textarea>'+
+    '<div><button>Send to '+esc(provider(p.starter))+'</button><span class="note" role="status"></span></div></form>';
+}
+async function requestRework(event) {
+  event.preventDefault();
+  const form=event.target, note=form.querySelector('.note'), button=form.querySelector('button');
+  button.disabled=true; note.textContent='Sending…';
+  try {
+    const response=await fetch('/api/post/'+encodeURIComponent(postId)+'/rework',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:form.body.value})});
+    if(!response.ok) throw new Error((await response.json().catch(()=>({}))).error || 'The board refused the request ('+response.status+').');
+    form.body.blur(); signature=''; update();
+  } catch(err) { note.textContent=err.message; button.disabled=false; }
 }
 async function json(url) {
   const response=await fetch(url);
@@ -79,7 +98,7 @@ async function update() {
     $('#hosts').innerHTML='<h2>Launchers</h2>'+Object.entries(data.hosts).map(([name,on])=>'<span class="'+(on?'online':'offline')+'">'+esc(name)+'<small>'+(on?'Online':'Offline')+'</small></span>').join('');
     const item=postId?await json('/api/post/'+encodeURIComponent(postId)):data;
     const next=JSON.stringify(item);
-    if(next!==signature && !($('#main').contains(document.activeElement)&&document.activeElement.tagName==='INPUT')){
+    if(next!==signature && !($('#main').contains(document.activeElement)&&['INPUT','TEXTAREA'].includes(document.activeElement.tagName))){
       if(postId) renderThread(item); else renderBoard(item);
       // A re-render recreates the masthead; offset its 40s rain loop by wall clock so it never jumps back.
       $('.masthead')?.style.setProperty('--rain-t','-'+(Date.now()%40000)+'ms');

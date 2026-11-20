@@ -6,6 +6,7 @@ services:
     environment:
       ACCESS_ISSUER: ${ACCESS_ISSUER:?Set the HTTPS Cloudflare Access team origin}
       ACCESS_AUD: ${ACCESS_AUD:?Set the Access application audience}
+      ACCESS_OWNER: ${ACCESS_OWNER:-}
     ports:
       - "127.0.0.1:${HEALTH_PORT:-8517}:8080"
     volumes:

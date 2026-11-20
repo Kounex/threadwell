@@ -16,6 +16,8 @@ p.add_argument("--host",required=True)
 p.add_argument("--url",required=True)
 p.add_argument("--native-updates",action="store_true",help="Run each native CLI updater at most daily on invitation")
 p.add_argument("--workspace",type=Path,default=home/"agent")
+p.add_argument("--rework",action="store_true",help="Allow owner rework requests to start full-permission starter sessions on this host")
+p.add_argument("--notify",help="Command run as CMD MESSAGE TITLE when a rework run ends")
 p.add_argument("transport",nargs=argparse.REMAINDER,help="After --, the executable and argv for store.py RPC")
 args=p.parse_args()
 cmd=args.transport[1:] if args.transport[:1]==["--"] else args.transport
@@ -23,8 +25,16 @@ if not cmd:
     p.error("provide an RPC transport after --")
 config=home/".config/threadwell"
 config.mkdir(mode=0o700,parents=True,exist_ok=True)
-(config/"config.json").write_text(json.dumps(dict(host=args.host,url=args.url,workspace=str(args.workspace),transport=cmd,
-    updates={peer:[peer,"update"] for peer in ("codex","claude")} if args.native_updates else {}),indent=2))
+target_config=config/"config.json"
+settings=json.loads(target_config.read_text()) if target_config.exists() else {}
+settings.update(host=args.host,url=args.url,workspace=str(args.workspace),transport=cmd,
+    updates={peer:[peer,"update"] for peer in ("codex","claude")} if args.native_updates else {})
+if args.rework:
+    settings["rework"]={"enabled":True,"timeout":1800,"claude_args":["--permission-mode","bypassPermissions"],
+        "codex_args":["--dangerously-bypass-approvals-and-sandbox"],"env":{},**{k:v for k,v in settings.get("rework",{}).items() if k!="enabled"}}
+if args.notify:
+    settings["notify"]=[args.notify]
+target_config.write_text(json.dumps(settings,indent=2))
 local=home/".local/bin/threadwell"
 local.parent.mkdir(parents=True,exist_ok=True)
 if not local.exists():

@@ -55,7 +55,7 @@ form { display: flex; align-items: center; gap: 8px; }
 header form { max-width: 570px; padding: 0 11px; border: 1px solid var(--line); background: #0d1611; }
 header form:focus-within { border-color: var(--green); }
 .glass { width: 15px; height: 15px; flex: none; overflow: hidden; text-indent: -999px; background: var(--secondary); clip-path: polygon(15% 0,60% 0,60% 12%,74% 12%,74% 54%,65% 54%,65% 64%,78% 64%,78% 74%,89% 74%,89% 83%,100% 83%,100% 100%,82% 100%,82% 89%,71% 89%,71% 80%,60% 80%,60% 67%,15% 67%,15% 56%,0 56%,0 12%,15% 12%,15% 25%,15% 48%,26% 48%,26% 55%,49% 55%,49% 47%,60% 47%,60% 22%,51% 22%,51% 13%,24% 13%,24% 25%,15% 25%); }
-input, button { font: inherit; color: var(--ink); border: 1px solid #3b5243; background: #101d15; padding: 8px 12px; border-radius: 2px; }
+input, button, textarea { font: inherit; color: var(--ink); border: 1px solid #3b5243; background: #101d15; padding: 8px 12px; border-radius: 2px; }
 input { min-width: 0; }
 input::placeholder { color: var(--muted); }
 header input { flex: 1; width: 12ch; background: transparent; border: 0; padding: 7px 2px; }
@@ -100,6 +100,17 @@ h2 { font: 600 18px/1.4 var(--mono); margin: 29px 0 12px; letter-spacing: -.045e
 .message > b::before { content: ""; width: 10px; height: 10px; background: #9fdaa8; clip-path: polygon(0 0,100% 0,100% 30%,30% 30%,30% 70%,100% 70%,100% 100%,0 100%); }
 .message.claude > b::before { background: #dfbb8d; clip-path: polygon(30% 0,70% 0,70% 30%,100% 30%,100% 70%,70% 70%,70% 100%,30% 100%,30% 70%,0 70%,0 30%,30% 30%); }
 .message .body { margin-top: 9px; }
+.model { margin-right: 12px; padding: 1px 6px; border: 1px solid var(--line); color: var(--muted); font: 12px/1.45 var(--mono); }
+.message.owner > b::before { background: var(--green); clip-path: polygon(20% 0,80% 0,80% 60%,100% 60%,100% 100%,0 100%,0 60%,20% 60%); }
+.message.earlier { opacity: .78; }
+.message .tag { margin-right: 8px; padding: 1px 6px; background: #1b3022; color: var(--green); font: 12px/1.45 var(--mono); }
+.rework { display: grid; gap: 10px; margin-top: 8px; padding: 18px 0 0; border-top: 1px solid var(--line); }
+.rework label { font: 600 14px var(--mono); color: var(--green); }
+.rework textarea { width: 100%; resize: vertical; min-height: 6em; color: var(--ink); background: #0d1611; border: 1px solid #3b5243; border-radius: 2px; padding: 10px 12px; line-height: 1.55; }
+.rework textarea:focus { outline: none; border-color: var(--green); }
+.rework div { display: flex; align-items: center; gap: 12px; }
+.rework .note { color: var(--secondary); font: 13px var(--mono); }
+.decision .by { display: flex; align-items: center; gap: 8px; margin: -2px 0 10px; color: var(--secondary); font: 600 13px var(--mono); }
 .body { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
 .body code { font: .89em/1.45 var(--mono); background: #1a2b20; color: #c2e8c4; padding: 1px 4px; }
 .body pre { max-width: 100%; overflow: auto; background: #0e1912; border: 1px solid var(--line); padding: 12px 16px; white-space: pre; }

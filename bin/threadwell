@@ -13,8 +13,8 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = Path.home()/".config/threadwell/config.json"
-LOCAL = Path.home()/".local/state/threadwell"
+CONFIG = Path(os.environ.get("THREADWELL_CONFIG") or Path.home()/".config/threadwell/config.json")
+LOCAL = Path(os.environ.get("THREADWELL_STATE") or Path.home()/".local/state/threadwell")
 CFG = {}
 
 
@@ -29,6 +29,51 @@ def rpc(op, **data):
 
 def url(pid):
     return CFG["url"].rstrip("/")+"/post/"+pid
+
+
+def last_model(path, pick):
+    found = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                try:
+                    found = pick(json.loads(line)) or found
+                except (ValueError, AttributeError):
+                    continue
+    except OSError:
+        return None
+    return found
+
+
+def session_model(provider):
+    """Model of the calling agent session, read from that CLI's own session log."""
+    if provider == "claude" and os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home()/".claude")/"projects"
+        logs = sorted(base.glob("*/"+os.environ["CLAUDE_CODE_SESSION_ID"]+".jsonl"))
+        pick = lambda d: d.get("type") == "assistant" and not d.get("isSidechain") and \
+            (d["message"].get("model") if d["message"].get("model") != "<synthetic>" else None)
+        return last_model(logs[-1], pick) if logs else None
+    if provider == "codex" and os.environ.get("CODEX_THREAD_ID"):
+        base = Path(os.environ.get("CODEX_HOME") or Path.home()/".codex")/"sessions"
+        logs = sorted(base.rglob("rollout-*-"+os.environ["CODEX_THREAD_ID"]+".jsonl"))
+        pick = lambda d: d.get("type") == "turn_context" and d["payload"].get("model")
+        return last_model(logs[-1], pick) if logs else None
+    return None
+
+
+def codex_banner_model(stderr):
+    # `codex exec` prints its settings between two dashed lines before echoing the prompt.
+    parts = stderr.split("\n--------\n")
+    header = parts[1] if len(parts) > 2 else ""
+    for line in header.splitlines():
+        if line.startswith("model: "):
+            return line[7:].strip()
+    return None
+
+
+def claude_result_model(response):
+    usage = response.get("modelUsage") or {}
+    return max(usage, key=lambda m: usage[m].get("outputTokens", 0)) if usage else None
 
 
 def codex_signed_in():
@@ -53,6 +98,12 @@ def prepare_cli(peer):
     return version
 
 
+def transcript(post):
+    label = {"owner": "owner (rework request)"}
+    return "\n\n".join(f'{label.get(r["author"], r["author"])}{" (earlier decision)" if r.get("kind") == "decision" else ""}: {r["body"]}'
+                       for r in post["replies"])
+
+
 def answer(post):
     pid, lease = post["id"], post["lease"]
     context = (LOCAL/(pid+".json"))
@@ -65,7 +116,7 @@ def answer(post):
             body=f"Sign in to Codex on {CFG['host']}. The launcher will retry this invitation automatically.")
         return
     root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
-    content = "\n\n".join(f'{r["author"]}: {r["body"]}' for r in post["replies"])
+    content = transcript(post)
     prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
               f"Next read the consultation protocol:\n{(ROOT/'AGENTS.md').read_text()}\n"
               f"You are the invited {peer} participant. The launcher publishes your final answer. "
@@ -92,48 +143,143 @@ def answer(post):
             args = ["claude","-p","--no-session-persistence","--permission-mode","dontAsk",
                     "--tools",tools,"--allowedTools","Read,Grep,Glob","--strict-mcp-config",
                     "--add-dir",str(source),"--output-format","json", *sandbox]
-        with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-            stdin.write(prompt.encode())
-            stdin.seek(0)
-            proc = subprocess.Popen(args, cwd=tmp, stdin=stdin, stdout=out, stderr=err, env=env, start_new_session=True)
-            deadline = time.monotonic()+720
-            try:
-                while proc.poll() is None:
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        if time.monotonic()>=deadline:
-                            raise RuntimeError("Participant timed out")
-                        if not rpc("pulse",host=CFG["host"],id=pid,lease=lease):
-                            return
-                if proc.returncode:
-                    # Preserve local diagnostics for the operator; keep CLI transcripts off the board.
-                    err.seek(0,2)
-                    err.seek(max(0,err.tell()-1500))
-                    print(err.read().decode(errors="replace"),file=sys.stderr,flush=True)
-                    raise RuntimeError(f"{peer} exited with status {proc.returncode}. Check the host launcher log and CLI login.")
-                if peer == "codex":
-                    result = final.read_text()
-                else:
-                    out.seek(0)
-                    response=json.load(out)
-                    if response.get("is_error"):
-                        raise RuntimeError("Claude Code reported an error. Check its login and account access.")
-                    result=response["result"]
-            finally:
-                if proc.poll() is None:
-                    os.killpg(proc.pid,signal.SIGTERM)
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid,signal.SIGKILL)
-                        proc.wait()
-    rpc("reply",id=pid,lease=lease,body=result.strip()[:64000])
+        alive = lambda: rpc("pulse", host=CFG["host"], id=pid, lease=lease)
+        try:
+            code, out, err = run_cli(args, prompt, tmp, env, time.monotonic()+720, alive)
+        except RuntimeError as exc:
+            if "lease" in str(exc):
+                return
+            raise RuntimeError("Participant timed out")
+        if code:
+            # Preserve local diagnostics for the operator; keep CLI transcripts off the board.
+            print(err[-1500:], file=sys.stderr, flush=True)
+            raise RuntimeError(f"{peer} exited with status {code}. Check the host launcher log and CLI login.")
+        if peer == "codex":
+            result, used = final.read_text(), codex_banner_model(err)
+        else:
+            response = json.loads(out)
+            if response.get("is_error"):
+                raise RuntimeError("Claude Code reported an error. Check its login and account access.")
+            result, used = response["result"], claude_result_model(response)
+    rpc("reply",id=pid,lease=lease,body=result.strip()[:64000],model=used)
+
+
+def run_cli(args, prompt, cwd, env, deadline, alive):
+    """Run a CLI session with the prompt on stdin. alive() is polled every 10s; returns (code, stdout, stderr)."""
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        stdin.write(prompt.encode())
+        stdin.seek(0)
+        proc = subprocess.Popen(args, cwd=cwd, stdin=stdin, stdout=out, stderr=err, env=env, start_new_session=True)
+        try:
+            while proc.poll() is None:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("timed out")
+                    if not alive():
+                        raise RuntimeError("lost its lease")
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+        out.seek(0)
+        err.seek(0)
+        return proc.returncode, out.read().decode(errors="replace"), err.read().decode(errors="replace")
+
+
+def checkout_problem(source):
+    workspace = Path(CFG["workspace"]).expanduser().resolve()
+    if source != workspace and workspace not in source.parents:
+        return f"{source} is outside the configured workspace"
+    top = subprocess.run(["git", "-C", str(source), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode:
+        return f"{source} is not a git checkout"
+    dirty = subprocess.run(["git", "-C", str(source), "status", "--porcelain"], capture_output=True, text=True).stdout
+    if dirty.strip():
+        return f"{source} has uncommitted changes; commit or stash them, then request the rework again"
+    return None
+
+
+def rework(pid, lease):
+    """One unattended starter session for an owner's rework request. Runs detached from the worker."""
+    post = rpc("show", id=pid)
+    starter, settings = post["starter"], CFG.get("rework") or {}
+    alive = lambda: rpc("reworkpulse", id=pid, lease=lease)
+    outcome, title = None, "Threadwell rework failed"
+    try:
+        context = LOCAL/(pid+".json")
+        if not context.exists():
+            raise RuntimeError(f"This thread's checkout is not recorded on {CFG['host']}")
+        source = Path(json.loads(context.read_text())["directory"]).resolve()
+        problem = checkout_problem(source) if source.is_dir() else f"{source} no longer exists"
+        if problem:
+            raise RuntimeError(problem)
+        version = prepare_cli(starter)
+        print(f"Rework {pid}: {version} in {source}", file=sys.stderr, flush=True)
+        root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
+        prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
+                  f"Next read the Threadwell protocol:\n{(ROOT/'AGENTS.md').read_text()}\n"
+                  f"You are the {starter} starter of this thread, resumed unattended for a rework run (see 'Rework run' above). "
+                  f"The owner questioned the decision; their request is the last message. "
+                  f"Thread: {url(pid)} (id {pid})\nCheckout: {source}\nProject: {post['project']}\nQuestion: {post['title']}\n\n"
+                  f"{transcript(post)}")
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env.update({k: str(v) for k, v in (settings.get("env") or {}).items()})
+        env["THREADWELL_REWORK"] = pid
+        with tempfile.TemporaryDirectory(prefix="threadwell-rework-") as tmp:
+            final = Path(tmp)/"answer.txt"
+            if starter == "codex":
+                args = ["codex", "exec", "--skip-git-repo-check", *settings.get("codex_args", []), "-o", str(final), "-"]
+            else:
+                args = ["claude", "-p", *settings.get("claude_args", []), "--output-format", "json"]
+            deadline = time.monotonic() + int(settings.get("timeout", 1800))
+            code, out, err = run_cli(args, prompt, str(source), env, deadline, alive)
+            if code:
+                print(err[-1500:], file=sys.stderr, flush=True)
+                raise RuntimeError(f"{starter} exited with status {code}. Check the host launcher log.")
+            if starter == "codex":
+                result, used = (final.read_text() if final.exists() else ""), codex_banner_model(err)
+            else:
+                response = json.loads(out)
+                if response.get("is_error"):
+                    raise RuntimeError("Claude Code reported an error. Check its login and account access.")
+                result, used = response.get("result", ""), claude_result_model(response)
+        closed = rpc("show", id=pid)["phase"] == "done"
+        title = "Threadwell rework finished" if closed else "Threadwell rework ended without a decision"
+        outcome = None if closed else ("The rework run ended without closing the thread, so the previous decision stands. "
+                                       f"Its last output ({used or starter}):\n\n{result.strip()}")
+    except Exception as exc:
+        outcome = f"Rework run on {CFG['host']} failed: {str(exc)[:1500]}. The previous decision stands."
+    rpc("reworked", id=pid, lease=lease, body=outcome)
+    notify = CFG.get("notify")
+    if notify:
+        subprocess.run([*notify, f"{post['title']}\n{url(pid)}", title], capture_output=True, timeout=30)
+
+
+def start_rework(post):
+    if not (CFG.get("rework") or {}).get("enabled"):
+        rpc("reworked", id=post["id"], lease=post["rework_lease"],
+            body=f"Rework runs are not enabled on {CFG['host']} (see the Threadwell README). The previous decision stands.")
+        return
+    LOCAL.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(LOCAL/"rework.log", "a") as log:
+        # Own session so a worker restart neither kills the run nor starts a duplicate; the run pulses its own lease.
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "rework-run", post["id"], post["rework_lease"]],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
 def worker():
     while True:
         try:
+            pending=rpc("claimrework",host=CFG["host"])
+            if pending:
+                start_rework(pending)
             post=rpc("claim",host=CFG["host"])
             if post and post.get("waiting_for"):
                 if codex_signed_in():
@@ -159,20 +305,27 @@ def main():
     start.add_argument("--project",help="Defaults to the enclosing ~/agent project, otherwise General")
     start.add_argument("--title",required=True)
     start.add_argument("--body",help="Defaults to standard input")
+    start.add_argument("--model",help="Shown next to the name; detected from the Claude Code or Codex session when omitted")
     for name in ("show","wait","ask","close","move"):
         sub=commands.add_parser(name)
         sub.add_argument("id")
         if name in ("ask","close"):
             sub.add_argument("--body",help="Defaults to standard input")
+            sub.add_argument("--model",help="Shown next to the name; detected from the session when omitted")
         if name=="move":
             sub.add_argument("project")
         if name=="wait":
             sub.add_argument("--timeout",type=int,default=180)
     commands.add_parser("worker")
+    run=commands.add_parser("rework-run",help="Internal: one detached rework session started by the worker")
+    run.add_argument("id")
+    run.add_argument("lease")
     args=parser.parse_args()
     CFG.update(json.loads(CONFIG.read_text()))
     if args.command=="worker":
         return worker()
+    if args.command=="rework-run":
+        return rework(args.id,args.lease)
     if args.command=="open":
         pid=str(uuid.uuid4())
         LOCAL.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -180,7 +333,8 @@ def main():
         workspace=Path(CFG["workspace"]).expanduser()
         name=args.project or (source.relative_to(workspace).parts[0] if workspace in source.parents else "General")
         (LOCAL/(pid+".json")).write_text(json.dumps({"directory":str(source)}))
-        rpc("open",id=pid,host=CFG["host"],starter=args.starter,project=name,title=args.title,body=args.body or sys.stdin.read())
+        rpc("open",id=pid,host=CFG["host"],starter=args.starter,project=name,title=args.title,body=args.body or sys.stdin.read(),
+            model=args.model or session_model(args.starter))
         print(url(pid))
     elif args.command=="wait":
         deadline=time.monotonic()+args.timeout
@@ -195,7 +349,9 @@ def main():
     elif args.command=="move":
         print(url(rpc("move",id=args.id,project=args.project)))
     else:
-        print(url(rpc(args.command,id=args.id,body=args.body or sys.stdin.read())))
+        body=args.body or sys.stdin.read()
+        used=args.model or session_model(rpc("show",id=args.id)["starter"])
+        print(url(rpc(args.command,id=args.id,body=body,model=used)))
 
 
 if __name__=="__main__":

@@ -1,4 +1,4 @@
-"""Shared storage. Mutations are available exclusively on trusted local stdio."""
+"""Shared storage. Mutations arrive on trusted local stdio, except the owner's rework request from the board."""
 import json
 import os
 import re
@@ -16,9 +16,10 @@ CREATE TABLE IF NOT EXISTS posts(
  id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(name),
  title TEXT NOT NULL, starter TEXT NOT NULL, host TEXT NOT NULL,
  phase TEXT NOT NULL, updated INTEGER NOT NULL, decision TEXT NOT NULL DEFAULT '',
- lease TEXT, started INTEGER);
+ lease TEXT, started INTEGER, decision_model TEXT,
+ rework TEXT, rework_lease TEXT, rework_seen INTEGER);
 CREATE TABLE IF NOT EXISTS replies(
- seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER);
+ seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER, model TEXT, kind TEXT);
 CREATE INDEX IF NOT EXISTS reply_post ON replies(post,seq);
 CREATE TABLE IF NOT EXISTS hosts(name TEXT PRIMARY KEY, seen INTEGER);
 """
@@ -35,6 +36,12 @@ def initialize():
     with connect() as db:
         db.execute("pragma journal_mode=wal")
         db.executescript(SCHEMA)
+        # Columns added after the first release; CREATE TABLE IF NOT EXISTS leaves existing tables alone.
+        added = (("posts", "decision_model"), ("posts", "rework"), ("posts", "rework_lease"), ("posts", "rework_seen"),
+                 ("replies", "model"), ("replies", "kind"))
+        for table, column in added:
+            if column not in {r[1] for r in db.execute(f"pragma table_info({table})")}:
+                db.execute(f"alter table {table} add column {column} TEXT")
 
 
 def thread(db, pid):
@@ -43,7 +50,7 @@ def thread(db, pid):
         raise ValueError("Post not found")
     result = dict(row)
     result["replies"] = [dict(r) for r in db.execute(
-        "select author,body,stamp from replies where post=? order by seq", (pid,))]
+        "select author,body,stamp,model,kind from replies where post=? order by seq", (pid,))]
     return result
 
 
@@ -52,6 +59,23 @@ def field(msg, key, limit=64000):
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
         raise ValueError(f"Invalid {key} (maximum {limit} characters)")
     return value.strip()
+
+
+def model(msg):
+    """Optional model identifier reported by the CLI that wrote a message."""
+    value = msg.get("model")
+    if not isinstance(value, str) or not re.fullmatch(r"[\w.:/@\[\]-]{1,80}", value.strip()):
+        return None
+    return value.strip()
+
+
+def finish_rework(db, pid, now, note):
+    """End a rework run. Without a fresh close the thread returns to its previous decision."""
+    closed = db.execute("select phase='done' from posts where id=?", (pid,)).fetchone()[0]
+    if note and not closed:
+        db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher", note[:64000], now))
+    db.execute("""update posts set rework=null,rework_lease=null,rework_seen=null,phase='done',lease=null,updated=?
+                  where id=?""", (now, pid))
 
 
 def project(db, name):
@@ -79,12 +103,32 @@ def dispatch(db, msg):
         name = project(db, field(msg, "project", 80))
         db.execute("insert into posts(id,project,title,starter,host,phase,updated) values(?,?,?,?,?,'queued',?)",
                    (pid, name, field(msg, "title", 200), starter, field(msg, "host", 80), now))
-        db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)",
-                   (pid, starter, field(msg, "body"), now))
+        db.execute("insert into replies(post,author,body,stamp,model) values(?,?,?,?,?)",
+                   (pid, starter, field(msg, "body"), now, model(msg)))
         return pid
     if op == "authready":
         db.execute("update posts set phase='queued',updated=? where host=? and phase='signin' and starter='claude'",
                    (now, field(msg, "host", 80)))
+        return True
+    if op == "claimrework":
+        host = field(msg, "host", 80)
+        for (stale,) in db.execute("select id from posts where rework='running' and rework_seen<?", (now-150,)).fetchall():
+            finish_rework(db, stale, now, "The rework run stopped responding. The previous decision stands.")
+        if db.execute("select 1 from posts where host=? and rework='running'", (host,)).fetchone():
+            return None
+        row = db.execute("select id from posts where host=? and rework='queued' order by updated,id limit 1", (host,)).fetchone()
+        if not row:
+            return None
+        db.execute("update posts set rework='running',rework_lease=?,rework_seen=? where id=?", (uuid.uuid4().hex, now, row[0]))
+        return thread(db, row[0])
+    if op in {"reworkpulse", "reworked"}:
+        current = db.execute("select 1 from posts where id=? and rework='running' and rework_lease=?",
+                             (msg["id"], msg["lease"])).fetchone()
+        if op == "reworkpulse" or not current:
+            if current:
+                db.execute("update posts set rework_seen=? where id=?", (now, msg["id"]))
+            return bool(current)
+        finish_rework(db, msg["id"], now, msg.get("body") or None)
         return True
     if op in {"claim", "pulse"}:
         host = field(msg, "host", 80)
@@ -104,7 +148,20 @@ def dispatch(db, msg):
     post = thread(db, pid)
     if op == "show":
         post.pop("lease")
+        post.pop("rework_lease")
         return post
+    if op == "rework":
+        if post["phase"] != "done" or post["rework"]:
+            raise ValueError("A rework can only be requested on a closed thread")
+        body = field(msg, "body", 8000)
+        kept = [r["body"] for r in post["replies"] if r["kind"] == "decision"]
+        if post["decision"] and kept[-1:] != [post["decision"]]:
+            # Keep the decision being questioned in the thread; a new close replaces posts.decision.
+            db.execute("insert into replies(post,author,body,stamp,model,kind) values(?,?,?,?,?,'decision')",
+                       (pid, post["starter"], post["decision"], post["updated"], post["decision_model"]))
+        db.execute("insert into replies(post,author,body,stamp,kind) values(?,'owner',?,?,'rework')", (pid, body, now))
+        db.execute("update posts set phase='answered',rework='queued',updated=? where id=?", (now, pid))
+        return pid
     if op == "move":
         db.execute("update posts set project=? where id=?", (project(db, field(msg, "project", 80)), pid))
         return pid
@@ -120,12 +177,13 @@ def dispatch(db, msg):
             raise ValueError("An invitation is already pending")
         author, phase = post["starter"], "queued"
     elif op == "close":
-        db.execute("update posts set phase='done',updated=?,lease=null,decision=? where id=?",
-                   (now, field(msg, "body"), pid))
+        db.execute("update posts set phase='done',updated=?,lease=null,decision=?,decision_model=? where id=?",
+                   (now, field(msg, "body"), model(msg), pid))
         return pid
     else:
         raise ValueError("Unknown command")
-    db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, author, field(msg, "body"), now))
+    db.execute("insert into replies(post,author,body,stamp,model) values(?,?,?,?,?)",
+               (pid, author, field(msg, "body"), now, model(msg) if author != "launcher" else None))
     db.execute("update posts set updated=?,phase=?,lease=null where id=?", (now, phase, pid))
     return pid
 
