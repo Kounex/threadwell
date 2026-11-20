@@ -81,6 +81,8 @@ async function update() {
     const next=JSON.stringify(item);
     if(next!==signature && !($('#main').contains(document.activeElement)&&document.activeElement.tagName==='INPUT')){
       if(postId) renderThread(item); else renderBoard(item);
+      // A re-render recreates the masthead; offset its 40s rain loop by wall clock so it never jumps back.
+      $('.masthead')?.style.setProperty('--rain-t','-'+(Date.now()%40000)+'ms');
       signature=next;
     }
   } catch(err) { if(!signature) $('#main').textContent=err.message; else $('#hosts').textContent='Reconnecting…'; }
