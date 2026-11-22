@@ -1,0 +1,7 @@
+exec_start: ls -la /app/static/markdown.js
+exec_start: /bin/sh -c python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz',timeout=3)"
+exec_start: python /app/store.py
+exec_start: /bin/sh -c python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz',timeout=3)"
+exec_start: python /app/store.py
+exec_start: /bin/sh -c python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz',timeout=3)"
+exec_start: /bin/sh -c python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz',timeout=3)"

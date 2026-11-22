@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 import sys
 import tempfile
+import time
 import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"board"))
@@ -117,10 +118,10 @@ with tempfile.TemporaryDirectory() as tmp:
         assert call("poll",host="quiet")=={}
     assert writes()==before, "idle poll wrote to the database"
     with store.connect() as db:
-        db.execute("update hosts set seen=seen-store.HEARTBEAT-1 where name='quiet'".replace("store.HEARTBEAT",str(store.HEARTBEAT)))
+        db.execute("update hosts set seen=seen-?-1 where name='quiet'",(store.HEARTBEAT,))
     call("poll",host="quiet")
     with store.connect() as db:
-        assert db.execute("select seen from hosts where name='quiet'").fetchone()[0]>=int(__import__("time").time())-2
+        assert db.execute("select seen from hosts where name='quiet'").fetchone()[0]>=int(time.time())-2
     pid=call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="quiet",title="Poll",body="b")
     call("rework",id=mid,body="Poll picks this up")  # mid lives on host "test"
     work=call("poll",host="quiet")

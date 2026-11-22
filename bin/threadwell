@@ -164,7 +164,13 @@ def answer(post):
             args = ["claude","-p","--permission-mode","dontAsk",
                     "--tools",tools,"--allowedTools","Read,Grep,Glob","--strict-mcp-config",
                     "--add-dir",str(source),"--output-format","json", *sandbox]
-        alive = lambda: rpc("pulse", host=CFG["host"], id=pid, lease=lease)
+        def alive():
+            # A board redeploy briefly breaks the transport; only an explicit "lease gone" stops the participant.
+            try:
+                return rpc("pulse", host=CFG["host"], id=pid, lease=lease)
+            except Exception as exc:
+                print(f"Invitation {pid}: pulse failed: {exc}", file=sys.stderr, flush=True)
+                return True
         try:
             code, out, err = run_cli(args, prompt, tmp, env, time.monotonic()+720, alive)
         except RuntimeError as exc:
@@ -182,7 +188,14 @@ def answer(post):
             if response.get("is_error"):
                 raise RuntimeError("Claude Code reported an error. Check its login and account access.")
             result, (used, level) = response["result"], claude_result_model(response, forget=True)
-    rpc("reply",id=pid,lease=lease,body=result.strip()[:64000],model=used,effort=level)
+    for attempt in range(6):
+        try:
+            return rpc("reply",id=pid,lease=lease,body=result.strip()[:64000],model=used,effort=level)
+        except RuntimeError as exc:
+            if attempt == 5 or any(word in str(exc) for word in ("expired", "closed", "Invalid", "not found")):
+                raise
+            print(f"Invitation {pid}: reply failed, retrying: {exc}", file=sys.stderr, flush=True)
+            time.sleep(20)
 
 
 def run_cli(args, prompt, cwd, env, deadline, alive):
