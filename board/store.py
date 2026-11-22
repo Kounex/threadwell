@@ -82,21 +82,100 @@ def finish_rework(db, pid, now, note):
                   where id=?""", (now, pid))
 
 
+def project_key(name):
+    """Lookup key: case and runs of spaces, hyphens and underscores don't matter ("Open Tech Quest" = "open-tech-quest")."""
+    return re.sub(r"[\s_-]+", "-", name.strip().casefold())
+
+
+def aliases(db, name):
+    """Every stored spelling of a project, the one holding the most posts first."""
+    key = project_key(name)
+    rows = db.execute("select name,(select count(*) from posts where project=name) from projects order by rowid").fetchall()
+    return [n for n, _ in sorted((r for r in rows if project_key(r[0]) == key), key=lambda r: -r[1])]
+
+
 def project(db, name):
     if not re.fullmatch(r"[\w][\w .-]{0,79}", name):
         raise ValueError("Use a short project name with letters, spaces, digits, dots or hyphens")
-    name = "General" if name.casefold() == "general" else name
-    existing = db.execute("select name from projects where name=? collate nocase", (name,)).fetchone()
+    name = "General" if project_key(name) == "general" else name
+    existing = aliases(db, name)
     if existing:
         return existing[0]
     db.execute("insert into projects values(?)", (name,))
     return name
 
 
+HEARTBEAT = 30  # seconds between host "seen" writes; the board shows a launcher online for 100 s
+
+
+def heartbeat(db, host, now):
+    db.execute("""insert into hosts values(?,?) on conflict(name) do update set seen=excluded.seen
+                  where seen<?""", (host, now, now-HEARTBEAT))
+
+
+def sweep(db, now):
+    """Fail invitations whose worker stopped pulsing, with a note that says so."""
+    for pid, host in db.execute("select id,host from posts where phase='running' and started<?", (now-960,)).fetchall():
+        db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
+                   f"The participant on {host} stopped responding, so this invitation was marked failed. "
+                   "Ask again to retry.", now))
+        db.execute("update posts set phase='failed',lease=null,updated=? where id=?", (now, pid))
+    for (stale,) in db.execute("select id from posts where rework='running' and rework_seen<?", (now-150,)).fetchall():
+        finish_rework(db, stale, now, "The rework run stopped responding. The previous decision stands.")
+
+
+def poll_due(db, host, now):
+    """Read-only check of whether a poll has anything to write: work, a sweep or a heartbeat."""
+    return db.execute("""select
+        exists(select 1 from posts where host=? and (phase in ('queued','signin') or rework='queued'))
+        or exists(select 1 from posts where (phase='running' and started<?) or (rework='running' and rework_seen<?))
+        or not exists(select 1 from hosts where name=? and seen>=?)""",
+        (host, now-960, now-150, host, now-HEARTBEAT)).fetchone()[0]
+
+
+def claim_rework(db, host, now):
+    if db.execute("select 1 from posts where host=? and rework='running'", (host,)).fetchone():
+        return None
+    row = db.execute("select id from posts where host=? and rework='queued' order by updated,id limit 1", (host,)).fetchone()
+    if not row:
+        return None
+    db.execute("update posts set rework='running',rework_lease=?,rework_seen=? where id=?", (uuid.uuid4().hex, now, row[0]))
+    return thread(db, row[0])
+
+
+def claim(db, host, now):
+    row = db.execute("select id from posts where host=? and phase='queued' order by updated,id limit 1", (host,)).fetchone()
+    if not row:
+        waiting = db.execute("select 1 from posts where host=? and phase='signin' limit 1", (host,)).fetchone()
+        return {"waiting_for": "codex"} if waiting else None
+    db.execute("update posts set phase='running',lease=?,started=? where id=?", (uuid.uuid4().hex, now, row[0]))
+    return thread(db, row[0])
+
+
+READS = {"show", "poll"}
+
+
 def dispatch(db, msg):
     op = msg["op"]
     now = int(time.time())
-    db.execute("begin immediate")
+    # Reads take no write lock: `wait` shows every few seconds and idle polls run all day.
+    db.execute("begin" if op in READS else "begin immediate")
+    if op == "poll":
+        # One call per worker cycle: a rework run and an invitation, each claimed independently.
+        host = field(msg, "host", 80)
+        if not poll_due(db, host, now):
+            return {}
+        db.commit()
+        db.execute("begin immediate")
+        heartbeat(db, host, now)
+        sweep(db, now)
+        result = {"rework": claim_rework(db, host, now)}
+        post = claim(db, host, now)
+        if post and post.get("waiting_for"):
+            result["waiting_for"] = post["waiting_for"]
+        elif post:
+            result["post"] = post
+        return {k: v for k, v in result.items() if v}
     if op == "project":
         return project(db, field(msg, "project", 80))
     if op == "open":
@@ -115,16 +194,9 @@ def dispatch(db, msg):
                    (now, field(msg, "host", 80)))
         return True
     if op == "claimrework":
-        host = field(msg, "host", 80)
-        for (stale,) in db.execute("select id from posts where rework='running' and rework_seen<?", (now-150,)).fetchall():
-            finish_rework(db, stale, now, "The rework run stopped responding. The previous decision stands.")
-        if db.execute("select 1 from posts where host=? and rework='running'", (host,)).fetchone():
-            return None
-        row = db.execute("select id from posts where host=? and rework='queued' order by updated,id limit 1", (host,)).fetchone()
-        if not row:
-            return None
-        db.execute("update posts set rework='running',rework_lease=?,rework_seen=? where id=?", (uuid.uuid4().hex, now, row[0]))
-        return thread(db, row[0])
+        # Kept for workers older than `poll`.
+        sweep(db, now)
+        return claim_rework(db, field(msg, "host", 80), now)
     if op in {"reworkpulse", "reworked"}:
         current = db.execute("select 1 from posts where id=? and rework='running' and rework_lease=?",
                              (msg["id"], msg["lease"])).fetchone()
@@ -135,19 +207,14 @@ def dispatch(db, msg):
         finish_rework(db, msg["id"], now, msg.get("body") or None)
         return True
     if op in {"claim", "pulse"}:
+        # `claim` is kept for workers older than `poll`.
         host = field(msg, "host", 80)
-        db.execute("insert or replace into hosts values(?,?)", (host, now))
-        db.execute("update posts set phase='failed',lease=null where phase='running' and started<?", (now-960,))
+        heartbeat(db, host, now)
+        sweep(db, now)
         if op == "pulse":
             return bool(db.execute("select 1 from posts where id=? and lease=? and phase='running'",
                                    (msg["id"], msg["lease"])).fetchone())
-        row = db.execute("select id from posts where host=? and phase='queued' order by updated,id limit 1", (host,)).fetchone()
-        if not row:
-            waiting = db.execute("select 1 from posts where host=? and phase='signin' limit 1", (host,)).fetchone()
-            return {"waiting_for": "codex"} if waiting else None
-        db.execute("update posts set phase='running',lease=?,started=? where id=?",
-                   (uuid.uuid4().hex, now, row[0]))
-        return thread(db, row[0])
+        return claim(db, host, now)
     pid = msg["id"]
     post = thread(db, pid)
     if op == "show":

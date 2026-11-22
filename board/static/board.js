@@ -126,7 +126,7 @@ function renderBoard(data) {
     $('#main').innerHTML = masthead('Projects')+'<form><input type="search" name="q" aria-label="Find a project" placeholder="Find a project" value="'+esc(q)+'"><button>Find</button></form>'+ (projectRows(data.projects.filter(p=>p.name.toLowerCase().includes(q.toLowerCase()))) || '<p>No matching projects.</p>');
     return;
   }
-  const title = project || (q?'Search results':'Discussion board');
+  const title = (project && (data.project||project)) || (q?'Search results':'Discussion board');
   let body = (project?'<span class="crumb"><a href="/projects">Projects</a></span>':'')+masthead(title)+(project?scoped:'')+filters;
   if(q && !project) body+='<p>Results for <b>'+esc(q)+'</b></p>'+projectRows(data.projects.filter(p=>p.name.toLowerCase().includes(q.toLowerCase())));
   let previous = '';
@@ -140,17 +140,8 @@ function renderBoard(data) {
   if(offset || data.more) body+='<div class="bar">'+(offset?'<a href="'+queryLink('offset',Math.max(0,offset-50))+'">Previous</a>':'')+(data.more?'<a href="'+queryLink('offset',offset+50)+'">Next</a>':'')+'</div>';
   $('#main').innerHTML=body;
 }
-function prose(text) {
-  // Escape all source text before adding this small set of trusted markup.
-  return text.split(/^```[^\n]*$/m).map((piece,index) => {
-    const safe=esc(piece);
-    if(index%2) return '<pre><code>'+safe.trim()+'</code></pre>';
-    return safe.split(/(`[^`\n]+`)/).map(span =>
-      span.startsWith('`') && span.endsWith('`') ? '<code>'+span.slice(1,-1)+'</code>' :
-      span.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>')
-    ).join('');
-  }).join('');
-}
+// Messages and decisions: the escaped Markdown subset in markdown.js.
+const prose = text => renderMarkdown(text);
 function renderThread(p) {
   const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','owner'].includes(r.author)?r.author:'launcher')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model,r.effort)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
   $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><p class="by">'+esc(provider(p.starter))+model(p.decision_model,p.decision_effort)+'</p><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+composer(p)+'</div>';
@@ -188,7 +179,7 @@ async function update() {
     const args=new URLSearchParams(params);
     if(project) args.set('project',project);
     const data=await json('/api/board?'+args);
-    $('#rail').innerHTML='<h2>Projects</h2><div class="links">'+data.projects.map(p=>'<a class="'+(project===p.name?'here':'')+'" href="'+link(p.name)+'">'+esc(p.name)+'<small>'+p.count+'</small></a>').join('')+'</div>';
+    $('#rail').innerHTML='<h2>Projects</h2><div class="links">'+data.projects.map(p=>'<a class="'+(project&&(data.project||project)===p.name?'here':'')+'" href="'+link(p.name)+'">'+esc(p.name)+'<small>'+p.count+'</small></a>').join('')+'</div>';
     $('#hosts').innerHTML='<h2>Launchers</h2>'+Object.entries(data.hosts).map(([name,on])=>'<span class="'+(on?'online':'offline')+'">'+esc(name)+'<small>'+(on?'Online':'Offline')+'</small></span>').join('');
     const item=postId?await json('/api/post/'+encodeURIComponent(postId)):data;
     const next=JSON.stringify(item);

@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from store import connect, dispatch, initialize, thread
+from store import aliases, connect, dispatch, initialize, thread
 
 STATIC = Path(__file__).parent / "static"
 LOCAL = os.environ.get("THREADWELL_PREVIEW") == "1"
@@ -28,9 +28,11 @@ def index(db, args):
     status = args.get("status", [""])[0]
     offset = max(0, int(args.get("offset", ["0"])[0]))
     filters, params = [], []
+    # Every spelling of the project ("open-tech-quest" = "Open Tech Quest") shows the same discussions.
+    names = aliases(db, project) if project else []
     if project:
-        filters.append("project=?")
-        params.append(project)
+        filters.append("project in (%s)" % ",".join("?"*max(1, len(names))))
+        params.extend(names or [project])
     if term:
         filters.append("""(instr(lower(project),lower(?)) or instr(lower(title),lower(?))
           or instr(lower(decision),lower(?)) or exists(select 1 from replies
@@ -41,9 +43,11 @@ def index(db, args):
     where = " where " + " and ".join(filters) if filters else ""
     rows = db.execute("select id,project,title,starter,phase,host,updated,rework from posts" + where +
                       " order by (phase='done'),updated desc,rowid desc limit 51 offset ?", [*params, offset]).fetchall()
-    return {"posts": [dict(r) for r in rows[:50]], "more": len(rows)>50,
+    return {"posts": [dict(r) for r in rows[:50]], "more": len(rows)>50, "project": names[0] if names else project,
+            # Empty projects stay out of the rail and directory; General is always listed.
             "projects": [dict(r) for r in db.execute("""select name,count(id) as count from projects
-              left join posts on project=name group by name order by (name='General') desc,name collate nocase""")],
+              left join posts on project=name group by name having count(id)>0 or name='General'
+              order by (name='General') desc,name collate nocase""")],
             "hosts": {r["name"]: time.time()-r["seen"] < 100 for r in db.execute("select * from hosts")}}
 
 
@@ -124,7 +128,7 @@ class Board(BaseHTTPRequestHandler):
                         row = db.execute("select seen from hosts where name=?", (result["host"],)).fetchone()
                         result["online"] = bool(row and time.time()-row[0]<100)
                 return self.send(200, json.dumps(result).encode(), "application/json")
-            files = {"/style.css": "style.css", "/board.js": "board.js", "/mark.svg":"mark.svg",
+            files = {"/style.css": "style.css", "/board.js": "board.js", "/markdown.js": "markdown.js", "/mark.svg":"mark.svg",
                      "/rain.png": "rain.png", "/fonts/bitcount-latin-400.woff2": "fonts/bitcount-latin-400.woff2"}
             if path.path in files:
                 name = files[path.path]

@@ -17,7 +17,7 @@ p.add_argument("--url",required=True)
 p.add_argument("--native-updates",action="store_true",help="Run each native CLI updater at most daily on invitation")
 p.add_argument("--workspace",type=Path,default=home/"agent")
 p.add_argument("--rework",action="store_true",help="Allow owner rework requests to start full-permission starter sessions on this host")
-p.add_argument("--notify",help="Command run as CMD MESSAGE TITLE when a rework run ends")
+p.add_argument("--notify",help="Command run as CMD MESSAGE TITLE when an invitation fails or waits for sign-in, and when a rework run ends")
 p.add_argument("transport",nargs=argparse.REMAINDER,help="After --, the executable and argv for store.py RPC")
 args=p.parse_args()
 cmd=args.transport[1:] if args.transport[:1]==["--"] else args.transport

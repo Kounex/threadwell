@@ -132,6 +132,8 @@ def answer(post):
     if peer == "codex" and not codex_signed_in():
         rpc("signin", id=pid, lease=lease,
             body=f"Sign in to Codex on {CFG['host']}. The launcher will retry this invitation automatically.")
+        notify(post, f"Threadwell: sign in to Codex on {CFG['host']}",
+               "An invitation is waiting for the Codex login. It resumes by itself after `codex login`.")
         return
     root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
     content = transcript(post)
@@ -315,27 +317,88 @@ def start_rework(post):
         subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
+IDLE = 30  # seconds between polls while nothing happens; a local open/ask wakes the worker at once
+
+
+def wake():
+    """Tell this host's worker that an invitation was just queued (checked once a second, no subprocess)."""
+    try:
+        LOCAL.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (LOCAL/"wake").touch()
+    except OSError:
+        pass
+
+
+def woken():
+    try:
+        return (LOCAL/"wake").stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def notify(post, title, reason):
+    """Push once per invitation and event (CFG notify: CMD MESSAGE TITLE); delivery problems only reach the log."""
+    command = CFG.get("notify")
+    if not command:
+        return
+    asked = sum(r["author"] == post["starter"] for r in post.get("replies", []))
+    sent = LOCAL/"notified.json"
+    try:
+        seen = json.loads(sent.read_text()) if sent.exists() else {}
+    except ValueError:
+        seen = {}
+    key = f"{post['id']}:{asked}:{title}"
+    if key in seen:
+        return
+    seen[key] = int(time.time())
+    seen = dict(sorted(seen.items(), key=lambda kv: kv[1])[-200:])
+    try:
+        sent.write_text(json.dumps(seen))
+        result = subprocess.run([*command, f"{post['title']}\n{reason}\n{url(post['id'])}", title],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            print(f"notify exited {result.returncode}: {result.stderr.strip()[-300:]}", file=sys.stderr, flush=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"notify: {exc}", file=sys.stderr, flush=True)
+
+
+def invite(post):
+    try:
+        answer(post)
+    except Exception as exc:
+        reason = str(exc)[:1500] or "Launch failed"
+        rpc("failed", id=post["id"], lease=post["lease"], body=reason)
+        notify(post, f"Threadwell invitation failed on {CFG['host']}", reason)
+
+
 def worker():
     while True:
+        mark, busy = woken(), False
         try:
-            pending=rpc("claimrework",host=CFG["host"])
-            if pending:
-                start_rework(pending)
-            post=rpc("claim",host=CFG["host"])
-            if post and post.get("waiting_for"):
-                if codex_signed_in():
-                    rpc("authready",host=CFG["host"])
-                    continue
-                time.sleep(20)
-            elif post:
+            # One call per cycle; the rework and the invitation are claimed and handled independently.
+            work = rpc("poll", host=CFG["host"]) or {}
+            if work.get("rework"):
                 try:
-                    answer(post)
+                    start_rework(work["rework"])
                 except Exception as exc:
-                    rpc("failed",id=post["id"],lease=post["lease"],body=str(exc)[:1500] or "Launch failed")
-                continue
+                    reason = f"Rework run on {CFG['host']} could not start: {str(exc)[:1500]}. The previous decision stands."
+                    rpc("reworked", id=work["rework"]["id"], lease=work["rework"]["rework_lease"], body=reason)
+                    notify(work["rework"], "Threadwell rework failed", reason)
+            if work.get("post"):
+                invite(work["post"])
+                busy = True
+            elif work.get("waiting_for") and codex_signed_in():
+                rpc("authready", host=CFG["host"])
+                busy = True
         except Exception as exc:
-            print(str(exc),file=sys.stderr,flush=True)
-        time.sleep(8)
+            print(str(exc), file=sys.stderr, flush=True)
+        if busy:
+            continue
+        # Sleep until the next poll, or until open/ask on this host touches the wake file (also during the RPC above).
+        for _ in range(IDLE):
+            if woken() != mark:
+                break
+            time.sleep(1)
 
 
 def detected(args, provider):
@@ -383,6 +446,7 @@ def main():
         (LOCAL/(pid+".json")).write_text(json.dumps({"directory":str(source)}))
         rpc("open",id=pid,host=CFG["host"],starter=args.starter,project=name,title=args.title,body=args.body or sys.stdin.read(),
             **detected(args, args.starter))
+        wake()
         print(url(pid))
     elif args.command=="wait":
         deadline=time.monotonic()+args.timeout
@@ -399,6 +463,8 @@ def main():
     else:
         body=args.body or sys.stdin.read()
         print(url(rpc(args.command,id=args.id,body=body,**detected(args, rpc("show",id=args.id)["starter"]))))
+        if args.command=="ask":
+            wake()
 
 
 if __name__=="__main__":

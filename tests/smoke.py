@@ -1,5 +1,7 @@
 """Exercise invitation ordering, thread promotion and search with a disposable DB."""
 import os
+import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -102,4 +104,63 @@ with tempfile.TemporaryDirectory() as tmp:
     post=call("show",id=mid)
     assert post["phase"]=="done" and post["rework"] is None and "stopped responding" in post["replies"][-1]["body"]
     assert not call("reworkpulse",id=mid,lease=run["rework_lease"])
-print("Passed lifecycle, stale reply, promotion, scoped search, model and rework checks.")
+    # `poll`: one call per worker cycle. Idle polls write nothing once the heartbeat is fresh.
+    def writes():
+        with store.connect() as db:
+            db.execute("pragma wal_checkpoint(truncate)")
+        return os.path.getsize(os.environ["THREADWELL_DB"]+"-wal")
+    assert call("poll",host="quiet")=={}
+    with store.connect() as db:
+        assert db.execute("select seen from hosts where name='quiet'").fetchone()
+    before=writes()
+    for _ in range(5):
+        assert call("poll",host="quiet")=={}
+    assert writes()==before, "idle poll wrote to the database"
+    with store.connect() as db:
+        db.execute("update hosts set seen=seen-store.HEARTBEAT-1 where name='quiet'".replace("store.HEARTBEAT",str(store.HEARTBEAT)))
+    call("poll",host="quiet")
+    with store.connect() as db:
+        assert db.execute("select seen from hosts where name='quiet'").fetchone()[0]>=int(__import__("time").time())-2
+    pid=call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="quiet",title="Poll",body="b")
+    call("rework",id=mid,body="Poll picks this up")  # mid lives on host "test"
+    work=call("poll",host="quiet")
+    assert work["post"]["id"]==pid and "rework" not in work
+    both=call("poll",host="test")
+    assert both["rework"]["id"]==mid and "post" not in both
+    call("reworked",id=mid,lease=both["rework"]["rework_lease"],body="done")
+    # A participant that stops pulsing is failed with a note saying so.
+    with store.connect() as db:
+        db.execute("update posts set started=started-1000 where id=?",(pid,))
+    call("poll",host="quiet")
+    post=call("show",id=pid)
+    assert post["phase"]=="failed" and "stopped responding" in post["replies"][-1]["body"]
+    # `show` takes no write lock, so a starter's `wait` never blocks the workers.
+    with store.connect() as writer:
+        writer.execute("begin immediate")
+        assert call("show",id=pid)["id"]==pid
+        writer.rollback()
+
+    # Project names: case and space/hyphen/underscore don't matter; the populated spelling wins; empty ones are hidden.
+    # Legacy data: both spellings stored, only one holds a post.
+    oid=call("open",id=str(uuid.uuid4()),project="General",starter="codex",host="test",title="Backups",body="b")
+    with store.connect() as db:
+        db.executemany("insert into projects values(?)",[("open-tech-quest",),("Open Tech Quest",)])
+        db.execute("update posts set project='Open Tech Quest' where id=?",(oid,))
+    nid=call("open",id=str(uuid.uuid4()),project="open_tech  quest",starter="codex",host="test",title="Restore",body="b")
+    assert call("show",id=nid)["project"]=="Open Tech Quest"
+    assert call("project",project="GENERAL")=="General"
+    with store.connect() as db:
+        board=index(db,dict(project=["open-tech-quest"]))
+        assert board["project"]=="Open Tech Quest" and {p["id"] for p in board["posts"]}=={oid,nid}
+        names=[p["name"] for p in index(db,{})["projects"]]
+        assert names[0]=="General" and "open-tech-quest" not in names and "Open Tech Quest" in names
+    call("project",project="Empty One")
+    with store.connect() as db:
+        assert "Empty One" not in [p["name"] for p in index(db,{})["projects"]]
+
+node=shutil.which("node")
+if node:
+    subprocess.run([node,str(Path(__file__).with_name("markdown.test.js"))],check=True)
+else:
+    print("node not found: skipped the markdown renderer checks.")
+print("Passed lifecycle, stale reply, promotion, scoped search, model, rework, poll and project checks.")
