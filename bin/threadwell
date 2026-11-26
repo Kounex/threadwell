@@ -181,6 +181,8 @@ def read_only(paths, scratch):
         # configs (no host hooks or MCP servers in a participant turn), nor anything else in ~/.gemini (browser
         # profile, other credentials) or ~/Library.
         reads = (tree(*paths, state, home/".gemini/config", home/".local/bin", home/".config/git", home/".config/shell") + " " +
+                 # git and path resolution need the checkout's parent directories themselves (not their contents)
+                 exact(*{parent for d in paths for parent in Path(d).parents if home in parent.parents}) + " " +
                  exact(home, home/".gemini", home/".gemini/AGENTS.md", home/".gemini/GEMINI.md", home/".zshenv",
                        home/".zshrc", home/".zprofile", home/".gitconfig", home/".config", home/"Library"))
         # Writes: agy's CLI state (minus what later runs would execute or obey) and the scratch directory.
