@@ -49,6 +49,9 @@ def initialize():
                 db.execute(f"alter table {table} add column {name} {kind or 'TEXT'}")
         # Before rounds, a thread could wait in 'signin' for Codex; now that is a skipped turn, so let it run.
         db.execute("update posts set phase='queued' where phase='signin'")
+        # Open threads from before rounds: the round is the starter's latest question.
+        db.execute("""update posts set round_seq=(select max(seq) from replies where post=posts.id and author=posts.starter)
+                      where round_seq is null and phase!='done'""")
 
 
 def thread(db, pid):
@@ -64,7 +67,8 @@ def thread(db, pid):
     result["pending"] = (result["pending"] or "").split(",") if result["pending"] else []
     # The current (or last) round: who answered, whose turn was skipped, who is still due.
     this_round = [r for r in result["replies"] if r["seq"] > (result["round_seq"] or 0)]
-    result["round"] = {"answered": [r["author"] for r in this_round if r["author"] not in ("launcher", "owner")],
+    result["round"] = {"answered": [r["author"] for r in this_round
+                                    if r["author"] not in ("launcher", "owner", result["starter"])],
                        "skipped": [r["kind"][8:] for r in this_round if (r["kind"] or "").startswith("skipped:")],
                        "pending": result["pending"]}
     return result
@@ -98,13 +102,13 @@ def start_round(db, pid, seq, queue, now):
 
 def advance(db, pid, now):
     """The current agent is done (answered or failed): queue the next one, or end the round."""
-    post = db.execute("select pending,agent,round_seq from posts where id=?", (pid,)).fetchone()
+    post = db.execute("select pending,agent,round_seq,starter from posts where id=?", (pid,)).fetchone()
     queue = [a for a in (post["pending"] or "").split(",") if a and a != post["agent"]]
     if queue:
         phase = "queued"
     else:
-        answered = db.execute("""select 1 from replies where post=? and seq>? and author not in ('launcher','owner')
-                                 limit 1""", (pid, int(post["round_seq"] or 0))).fetchone()
+        answered = db.execute("""select 1 from replies where post=? and seq>? and author not in ('launcher','owner',?)
+                                 limit 1""", (pid, int(post["round_seq"] or 0), post["starter"])).fetchone()
         phase = "answered" if answered else "failed"
     db.execute("update posts set phase=?,pending=?,agent=null,lease=null,started=null,updated=? where id=?",
                (phase, ",".join(queue) or None, now, pid))
@@ -323,7 +327,7 @@ def dispatch(db, msg):
         if post["phase"] not in {"answered", "failed"}:
             raise ValueError("A round is still running; wait for it to finish")
         invited = post["participants"]
-        queue = [a for a in agents(msg["to"], "to") if a in invited] if msg.get("to") and op == "ask" else invited
+        queue = [a for a in agents(msg["to"], "to") if a in invited] if msg.get("to") else invited
         if not queue:
             raise ValueError("None of those agents takes part in this thread: " + ", ".join(invited))
         rounds = db.execute("select count(*) from replies where post=? and author=? and (kind is null or kind='proposal')",
@@ -340,11 +344,13 @@ def dispatch(db, msg):
                                  "); wait for it, or close with --force to record who never answered")
             db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
                        "Closed before " + ", ".join(post["pending"]) + " answered.", now))
-        # The participants review the starter's choice before it becomes the decision: a proposal must follow
-        # the opening question, or the owner's latest rework request.
-        anchor = max([r["seq"] for r in post["replies"] if r["author"] == post["starter"] and r["kind"] is None][:1] +
-                     [r["seq"] for r in post["replies"] if r["kind"] == "rework"])
-        reviewed = any(r["kind"] == "proposal" and r["seq"] > anchor for r in post["replies"])
+        # The participants review the starter's choice before it becomes the decision: the latest round must be
+        # a proposal (not a question, and not superseded by an owner's rework request), and someone reviewed it.
+        rounds = [r for r in post["replies"] if r["kind"] == "rework" or
+                  (r["author"] == post["starter"] and r["kind"] in (None, "proposal"))]
+        latest = rounds[-1] if rounds else {}
+        reviewed = latest.get("kind") == "proposal" and any(
+            r["seq"] > latest["seq"] and r["author"] not in ("launcher", "owner", post["starter"]) for r in post["replies"])
         if post["participants"] and not reviewed:
             if not msg.get("force"):
                 raise ValueError("Post your intended decision with `threadwell propose` first, so the participants "

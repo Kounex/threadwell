@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as tmp:
         raise AssertionError("closed without the participants reviewing the decision")
     except ValueError as exc:
         assert "propose" in str(exc)
-    call("propose",id=mid,body="Decision: LRU, because ...",to=["nobody"])  # a proposal always goes to everyone
+    call("propose",id=mid,body="Decision: LRU, because ...")
     review=claim("test")
     assert review["agent"]=="codex" and review["replies"][-1]["kind"]=="proposal"
     call("reply",id=mid,lease=review["lease"],body="Agree",model="gpt-5.6-terra")
@@ -209,6 +209,35 @@ with tempfile.TemporaryDirectory() as tmp:
     turn=claim("trio")
     assert claim("trio") is None
     call("close",id=tid,body="A",force=True)
+    # Closing needs a reviewed proposal as the latest round: not one nobody reviewed, not one followed by a question.
+    rid=str(uuid.uuid4())
+    call("open",id=rid,project="General",starter="claude",host="review",title="Review",body="q",participants=["codex","antigravity"])
+    def turns(outcome):
+        while (turn:=claim("review")):
+            call(outcome,id=rid,lease=turn["lease"],body=outcome)
+    turns("reply")
+    call("propose",id=rid,body="Plan A")
+    turns("failed")
+    def refused():
+        try:
+            call("close",id=rid,body="A")
+            raise AssertionError("closed an unreviewed decision")
+        except ValueError as exc:
+            assert "propose" in str(exc)
+    refused()
+    call("propose",id=rid,body="Retry: review Plan A above",to=["codex"])  # retry one skipped reviewer
+    retry=claim("review")
+    assert retry["agent"]=="codex" and claim("review") is None
+    call("reply",id=rid,lease=retry["lease"],body="Object: B is safer")
+    call("ask",id=rid,body="Would B break the importer?")
+    turns("reply")
+    refused()
+    call("propose",id=rid,body="Plan B")
+    turns("reply")
+    call("close",id=rid,body="B")
+    with store.connect() as db:
+        rows={p["id"]:p for p in index(db,{})["posts"]}
+        assert rows[rid]["pending"]==[]
     post=call("show",id=tid)
     assert post["phase"]=="done" and not post["pending"] and "Closed before" in post["replies"][-2]["body"]
     try:
@@ -285,8 +314,12 @@ with tempfile.TemporaryDirectory() as tmp:
     call("reply",id=mid,lease=turn["lease"],body="first")
     post=call("show",id=mid)
     assert isinstance(post["round_seq"],int) and post["round"]["answered"]==[turn["agent"]] and post["phase"]=="queued"
+    legacy=call("show",id="00000000-0000-4000-8000-000000000001")
+    assert legacy["round"]["answered"]==[] and legacy["round_seq"]==legacy["replies"][0]["seq"]
     waiting=call("poll",host="signer",rounds=1)["post"]  # a pre-rounds Codex sign-in wait is a normal turn now
     assert waiting["agent"]=="codex" and waiting["participants"]==["codex"]
+    call("failed",id=waiting["id"],lease=waiting["lease"],body="still not signed in")
+    assert call("show",id=waiting["id"])["phase"]=="failed"  # the starter's question is not an answer
 
 # The launcher's commands, end to end through a local transport (argument parsing included).
 with tempfile.TemporaryDirectory() as tmp:

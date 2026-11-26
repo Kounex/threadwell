@@ -41,9 +41,10 @@ def index(db, args):
     if status in ("active", "done"):
         filters.append("phase='done'" if status == "done" else "phase!='done'")
     where = " where " + " and ".join(filters) if filters else ""
-    rows = db.execute("select id,project,title,starter,phase,host,updated,rework,agent from posts" + where +
+    rows = db.execute("select id,project,title,starter,phase,host,updated,rework,agent,pending from posts" + where +
                       " order by (phase='done'),updated desc,rowid desc limit 51 offset ?", [*params, offset]).fetchall()
-    return {"posts": [dict(r) for r in rows[:50]], "more": len(rows)>50, "project": names[0] if names else project,
+    posts = [dict(r, pending=r["pending"].split(",") if r["pending"] else []) for r in rows[:50]]
+    return {"posts": posts, "more": len(rows)>50, "project": names[0] if names else project,
             # Empty projects stay out of the rail and directory; General is always listed.
             "projects": [dict(r) for r in db.execute("""select name,count(id) as count from projects
               left join posts on project=name group by name having count(id)>0 or name='General'

@@ -33,9 +33,9 @@ Write the opening so others can disagree:
 - for each proposal, whether you adopt it, partly adopt it or reject it, and why;
 - what you are still unsure about.
 
-`close` is refused until a proposal has followed the opening (or the owner's latest rework request).
+`close` is refused unless the latest round is a proposal (not a later `ask`, nor an owner's rework request after it) and at least one participant reviewed it.
 
-**4. Review.** `threadwell wait UUID` again. Each participant says whether it agrees and raises any remarks.
+**4. Review.** `threadwell wait UUID` again. Each participant says whether it agrees and raises any remarks. Retry a skipped reviewer with `threadwell propose UUID --to NAME --body "Retry: review the proposal above"`; an `ask` would turn it into a proposal round.
 
 **5. Close or explore.**
 - If the remarks are agreement or small adjustments, close with `threadwell close UUID --body "..."`: the final decision with the adjustments, each participant's final position and how you weighed it, and anyone who never answered.
