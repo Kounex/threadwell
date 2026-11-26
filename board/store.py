@@ -42,10 +42,11 @@ def initialize():
         # Columns added after the first release; CREATE TABLE IF NOT EXISTS leaves existing tables alone.
         added = (("posts", "decision_model"), ("posts", "decision_effort"), ("posts", "rework"), ("posts", "rework_lease"),
                  ("posts", "rework_seen"), ("posts", "participants"), ("posts", "pending"), ("posts", "agent"),
-                 ("posts", "round_seq"), ("replies", "model"), ("replies", "kind"), ("replies", "effort"))
+                 ("posts", "round_seq INTEGER"), ("replies", "model"), ("replies", "kind"), ("replies", "effort"))
         for table, column in added:
-            if column not in {r[1] for r in db.execute(f"pragma table_info({table})")}:
-                db.execute(f"alter table {table} add column {column} TEXT")
+            name, _, kind = column.partition(" ")
+            if name not in {r[1] for r in db.execute(f"pragma table_info({table})")}:
+                db.execute(f"alter table {table} add column {name} {kind or 'TEXT'}")
 
 
 def thread(db, pid):
@@ -53,6 +54,8 @@ def thread(db, pid):
     if row is None:
         raise ValueError("Post not found")
     result = dict(row)
+    # 0.1.11 added round_seq as TEXT on existing boards, so stored values may be strings.
+    result["round_seq"] = int(result["round_seq"]) if result["round_seq"] is not None else None
     result["replies"] = [dict(r) for r in db.execute(
         "select seq,author,body,stamp,model,effort,kind from replies where post=? order by seq", (pid,))]
     result["participants"] = participants(result)
@@ -99,7 +102,7 @@ def advance(db, pid, now):
         phase = "queued"
     else:
         answered = db.execute("""select 1 from replies where post=? and seq>? and author not in ('launcher','owner')
-                                 limit 1""", (pid, post["round_seq"] or 0)).fetchone()
+                                 limit 1""", (pid, int(post["round_seq"] or 0))).fetchone()
         phase = "answered" if answered else "failed"
     db.execute("update posts set phase=?,pending=?,agent=null,lease=null,started=null,updated=? where id=?",
                (phase, ",".join(queue) or None, now, pid))
@@ -201,7 +204,7 @@ def claim(db, host, now):
         return None  # one participant at a time per host, even with a duplicate worker
     # Oldest round first, so a round already under way finishes before a later thread starts.
     row = db.execute("""select * from posts where host=? and phase='queued'
-                        order by coalesce(round_seq,0),updated,id limit 1""", (host,)).fetchone()
+                        order by cast(coalesce(round_seq,0) as integer),updated,id limit 1""", (host,)).fetchone()
     if not row:
         return None
     queue = (row["pending"] or "").split(",") if row["pending"] else participants(row)

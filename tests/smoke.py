@@ -239,6 +239,30 @@ with tempfile.TemporaryDirectory() as tmp:
     with store.connect() as db:
         assert "Empty One" not in [p["name"] for p in index(db,{})["projects"]]
 
+# A board created before multi-agent rounds migrates in place (round_seq once arrived as a TEXT column).
+with tempfile.TemporaryDirectory() as tmp:
+    import sqlite3
+    store.DB=tmp+"/old.sqlite"
+    old=sqlite3.connect(store.DB)
+    old.executescript("""CREATE TABLE projects(name TEXT PRIMARY KEY); INSERT INTO projects VALUES('General');
+      CREATE TABLE posts(id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(name), title TEXT NOT NULL,
+        starter TEXT NOT NULL, host TEXT NOT NULL, phase TEXT NOT NULL, updated INTEGER NOT NULL,
+        decision TEXT NOT NULL DEFAULT '', lease TEXT, started INTEGER, round_seq TEXT);
+      CREATE TABLE replies(seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER);""")
+    old.close()
+    store.initialize()
+    def call(op, **fields):
+        with store.connect() as db:
+            return store.dispatch(db,dict(op=op,**fields))
+    for n in range(12):  # enough rows that text and numeric order of seq differ
+        call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="h"+str(n),title="t",body="b",participants=["codex"])
+    mid=str(uuid.uuid4())
+    call("open",id=mid,project="General",starter="claude",host="old",title="Migrated",body="b",participants=["codex","antigravity"])
+    turn=call("poll",host="old")["post"]
+    call("reply",id=mid,lease=turn["lease"],body="first")
+    post=call("show",id=mid)
+    assert isinstance(post["round_seq"],int) and post["round"]["answered"]==[turn["agent"]] and post["phase"]=="queued"
+
 node=shutil.which("node")
 if node:
     subprocess.run([node,str(Path(__file__).with_name("markdown.test.js"))],check=True)
