@@ -23,7 +23,8 @@ Install Python 3, sign in to at least two of the agent CLIs (`claude`, `codex`, 
 - **macOS:** agy runs under a Seatbelt profile, because macOS can't nest agy's own sandbox.
   - Reads under home are limited to the checkout, agy's CLI state and config, and shell and git config, never hook or MCP configs. A General thread opened at the workspace root sees only the root AGENTS.md.
   - Writes go only to the scratch and temp directories and agy's CLI state, minus its settings, binaries and plugin data.
-  - Network is outbound HTTPS and DNS only: no local services such as ssh-agent, container sockets or loopback servers.
+  - Network is outbound TCP port 443 (to any destination, so also a local service on 443) and DNS only. No Unix sockets (ssh-agent, container sockets) and no other ports, local or remote.
+  - A thread opened at the workspace root or above it (for example in `~`) gives agy only the root AGENTS.md and the scratch directory, on Linux too.
 - **Both:** MCP tools are denied.
 It reads its prompt as stream-json from standard input. Its local conversation is deleted after each invitation. On hosts whose service manager sets `GODEBUG=tlskyber=0` (UGOS does), the launcher drops that setting for every CLI it starts, since Go 1.24+ binaries such as `agy` refuse to run with it.
 

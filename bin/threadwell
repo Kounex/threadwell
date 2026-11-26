@@ -189,7 +189,7 @@ def read_only(paths, scratch, readable=None):
                  exact(home, home/".gemini", home/".gemini/AGENTS.md", home/".gemini/GEMINI.md", home/".zshenv",
                        home/".zshrc", home/".zprofile", home/".gitconfig", home/".config", home/"Library"))
         # Writes: agy's CLI state (minus what later runs would execute or obey) and the scratch directory.
-        writes = tree(state, scratch, Path(tempfile.gettempdir()).resolve())
+        writes = tree(state, scratch)  # participants get TMPDIR and XDG_CACHE_HOME in scratch
         frozen = exact(state/"settings.json") + " " + tree(*(state/d for d in ("bin", "builtin", "updater", "plugin_data",
                                                                               "mcp", "daemon")))
         prefix = ["sandbox-exec", "-p", "(version 1)(allow default)"
@@ -259,11 +259,12 @@ def agy_participant(source, tmp):
     workspace = Path(CFG["workspace"]).expanduser().resolve()
     protected = [workspace] + ([] if source == workspace or workspace in source.parents else [source])
     workdir, readable = source, None
-    if sys.platform == "darwin":
+    if source == workspace or source in workspace.parents:
+        # A General thread opened at the workspace root (or above it, e.g. in ~): no projects, no home, only the
+        # root instructions; agy works in the scratch directory.
+        protected, workdir, readable = [workspace], Path(tmp), [workspace/"AGENTS.md"]
+    elif sys.platform == "darwin":
         protected = [source]  # under Seatbelt this is also the read allowlist; the rest of home is unwritable anyway
-        if source == workspace:
-            # A General thread opened at the workspace root: no sibling projects, only the root instructions.
-            workdir, readable = Path(tmp), [workspace/"AGENTS.md"]
     deny = {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")] + ["mcp(*)"]}
     if sys.platform == "darwin":
         # agy's sandbox can't start inside Seatbelt; the outer profile is the limit, so commands run without asking.
