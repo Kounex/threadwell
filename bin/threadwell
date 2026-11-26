@@ -517,7 +517,7 @@ def worker():
         mark, busy = woken(), False
         try:
             # One call per cycle; the rework and the invitation are claimed and handled independently.
-            work = rpc("poll", host=CFG["host"]) or {}
+            work = rpc("poll", host=CFG["host"], rounds=1) or {}
             if work.get("rework"):
                 try:
                     start_rework(work["rework"])
@@ -560,12 +560,13 @@ def main():
         sub.add_argument("id")
         if name in ("ask","propose","close"):
             sub.add_argument("--body",help="Defaults to standard input")
+            sub.add_argument("--model",help="Shown next to the name; detected from the session when omitted")
+            sub.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
         if name=="ask":
             sub.add_argument("--to",help="Comma-separated participants to ask (default: all of them)")
         if name=="close":
-            sub.add_argument("--force",action="store_true",help="Close while a round is still running; records who never answered")
-            sub.add_argument("--model",help="Shown next to the name; detected from the session when omitted")
-            sub.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
+            sub.add_argument("--force",action="store_true",
+                             help="Close during a round or before the participants reviewed a proposal; the board records it")
         if name=="move":
             sub.add_argument("project")
         if name=="wait":

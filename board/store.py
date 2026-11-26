@@ -47,6 +47,8 @@ def initialize():
             name, _, kind = column.partition(" ")
             if name not in {r[1] for r in db.execute(f"pragma table_info({table})")}:
                 db.execute(f"alter table {table} add column {name} {kind or 'TEXT'}")
+        # Before rounds, a thread could wait in 'signin' for Codex; now that is a skipped turn, so let it run.
+        db.execute("update posts set phase='queued' where phase='signin'")
 
 
 def thread(db, pid):
@@ -129,11 +131,14 @@ def effort(msg):
 
 def finish_rework(db, pid, now, note):
     """End a rework run. Without a fresh close the thread returns to its previous decision."""
-    closed = db.execute("select phase='done' from posts where id=?", (pid,)).fetchone()[0]
+    closed, pending = db.execute("select phase='done',pending from posts where id=?", (pid,)).fetchone()
     if note and not closed:
         db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher", note[:64000], now))
-    db.execute("""update posts set rework=null,rework_lease=null,rework_seen=null,phase='done',lease=null,updated=?
-                  where id=?""", (now, pid))
+    if pending:
+        db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
+                   f"The rework run ended before {pending.replace(',', ', ')} answered; those turns were cancelled.", now))
+    db.execute("""update posts set rework=null,rework_lease=null,rework_seen=null,phase='done',lease=null,
+                  pending=null,agent=null,started=null,updated=? where id=?""", (now, pid))
 
 
 def project_key(name):
@@ -234,7 +239,8 @@ def dispatch(db, msg):
         db.execute("begin immediate")
         heartbeat(db, host, now)
         sweep(db, now)
-        result = {"rework": claim_rework(db, host, now), "post": claim(db, host, now)}
+        # Workers from before rounds also poll, but would run the wrong agent under this one's name.
+        result = {"rework": claim_rework(db, host, now), "post": claim(db, host, now) if msg.get("rounds") else None}
         return {k: v for k, v in result.items() if v}
     if op == "project":
         return project(db, field(msg, "project", 80))

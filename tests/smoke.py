@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory() as tmp:
         with store.connect() as db:
             return store.dispatch(db,dict(op=op,**fields))
     def claim(host):
-        return call("poll",host=host).get("post")
+        return call("poll",host=host,rounds=1).get("post")
 
     pid=call("open",id=str(uuid.uuid4()),project="General",starter="codex",host="test",title="Choose a parser",body="Compare error handling")
     invited=claim("test")
@@ -106,6 +106,13 @@ with tempfile.TemporaryDirectory() as tmp:
     run=call("claimrework",host="test")
     call("reworked",id=mid,lease=run["rework_lease"],body="Still nothing")
     kinds=[r["body"] for r in call("show",id=mid)["replies"] if r["kind"]=="decision"]
+    call("rework",id=mid,body="Ask codex, then stop")
+    run=call("claimrework",host="test")
+    call("ask",id=mid,body="Mid-rework question")
+    call("reworked",id=mid,lease=run["rework_lease"],body="Gave up")
+    post=call("show",id=mid)
+    assert post["phase"]=="done" and not post["pending"] and post["agent"] is None and "cancelled" in post["replies"][-1]["body"]
+    assert claim("test") is None
     assert kinds==["LRU","Switch to ARC"], kinds
 
     # A run that stops pulsing is swept.
@@ -136,9 +143,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert db.execute("select seen from hosts where name='quiet'").fetchone()[0]>=int(time.time())-2
     pid=call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="quiet",title="Poll",body="b")
     call("rework",id=mid,body="Poll picks this up")  # mid lives on host "test"
-    work=call("poll",host="quiet")
+    work=call("poll",host="quiet",rounds=1)
     assert work["post"]["id"]==pid and "rework" not in work
-    both=call("poll",host="test")
+    both=call("poll",host="test",rounds=1)
     assert both["rework"]["id"]==mid and "post" not in both
     call("reworked",id=mid,lease=both["rework"]["rework_lease"],body="done")
     # A participant that stops pulsing loses its turn with a note saying so (here it was the only one).
@@ -156,6 +163,10 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # Multi-agent rounds: every participant gets its own turn, one at a time per host, in rotating order.
     assert call("claim",host="test") is None  # workers older than rounds get no work
+    early=str(uuid.uuid4())
+    call("open",id=early,project="General",starter="claude",host="oldworker",title="Old",body="b",participants=["codex"])
+    assert "post" not in call("poll",host="oldworker"), "a worker without rounds was handed a turn"
+    assert claim("oldworker")["id"]==early
     tid=str(uuid.uuid4())
     call("open",id=tid,project="General",starter="antigravity",host="trio",title="Three-way",body="Undecided: A or B?",
          participants=["claude","codex","antigravity","claude"])
@@ -258,7 +269,9 @@ with tempfile.TemporaryDirectory() as tmp:
       CREATE TABLE posts(id TEXT PRIMARY KEY, project TEXT NOT NULL REFERENCES projects(name), title TEXT NOT NULL,
         starter TEXT NOT NULL, host TEXT NOT NULL, phase TEXT NOT NULL, updated INTEGER NOT NULL,
         decision TEXT NOT NULL DEFAULT '', lease TEXT, started INTEGER, round_seq TEXT);
-      CREATE TABLE replies(seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER);""")
+      CREATE TABLE replies(seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER);
+      INSERT INTO posts(id,project,title,starter,host,phase,updated) VALUES('00000000-0000-4000-8000-000000000001','General','Waiting','claude','signer','signin',1);
+      INSERT INTO replies(post,author,body,stamp) VALUES('00000000-0000-4000-8000-000000000001','claude','q',1);""")
     old.close()
     store.initialize()
     def call(op, **fields):
@@ -268,10 +281,42 @@ with tempfile.TemporaryDirectory() as tmp:
         call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="h"+str(n),title="t",body="b",participants=["codex"])
     mid=str(uuid.uuid4())
     call("open",id=mid,project="General",starter="claude",host="old",title="Migrated",body="b",participants=["codex","antigravity"])
-    turn=call("poll",host="old")["post"]
+    turn=call("poll",host="old",rounds=1)["post"]
     call("reply",id=mid,lease=turn["lease"],body="first")
     post=call("show",id=mid)
     assert isinstance(post["round_seq"],int) and post["round"]["answered"]==[turn["agent"]] and post["phase"]=="queued"
+    waiting=call("poll",host="signer",rounds=1)["post"]  # a pre-rounds Codex sign-in wait is a normal turn now
+    assert waiting["agent"]=="codex" and waiting["participants"]==["codex"]
+
+# The launcher's commands, end to end through a local transport (argument parsing included).
+with tempfile.TemporaryDirectory() as tmp:
+    import json
+    repo=Path(__file__).resolve().parents[1]
+    env={k:v for k,v in os.environ.items() if k not in ("CLAUDE_CODE_SESSION_ID","CODEX_THREAD_ID")}
+    env.update(THREADWELL_DB=tmp+"/cli.sqlite",THREADWELL_STATE=tmp+"/state",THREADWELL_CONFIG=tmp+"/config.json")
+    Path(tmp+"/config.json").write_text(json.dumps({"host":"cli","url":"http://board","workspace":tmp,"agents":["codex","claude"],
+        "transport":[sys.executable,str(repo/"board/store.py")]}))
+    store.DB=env["THREADWELL_DB"]
+    store.initialize()
+    def cli(*args, body="text", ok=True):
+        run=subprocess.run([sys.executable,str(repo/"bin/threadwell"),*args],input=body,text=True,capture_output=True,env=env,cwd=tmp)
+        assert (run.returncode==0)==ok, (args, run.stdout, run.stderr)
+        return run.stdout.strip() or run.stderr.strip()
+    pid=cli("open","--as","codex","--project","General","--title","CLI").rsplit("/",1)[1]
+    assert call("show",id=pid)["participants"]==["claude"]
+    assert "still running" in cli("ask",pid,ok=False)
+    def answer_turn():
+        turn=claim("cli")
+        call("reply",id=pid,lease=turn["lease"],body="answer")
+    answer_turn()
+    cli("ask",pid,"--to","claude","--model","gpt-x","--effort","high")
+    answer_turn()
+    assert "propose" in cli("close",pid,ok=False)
+    cli("propose",pid,"--model","gpt-x")
+    answer_turn()
+    cli("close",pid,"--model","gpt-x")
+    post=json.loads(cli("show",pid))
+    assert post["phase"]=="done" and [r["kind"] for r in post["replies"]]==[None,None,None,None,"proposal",None]
 
 node=shutil.which("node")
 if node:
