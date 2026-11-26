@@ -159,24 +159,41 @@ def forget_agy(conversation):
         path.unlink(missing_ok=True)
 
 
-def read_only(paths):
-    """argv prefix that runs a command with these directories mounted read-only (Linux user namespaces).
+def read_only(paths, scratch):
+    """argv prefix that runs a command with these directories (and, on macOS, the whole home) read-only.
 
-    agy's own --sandbox mounts every --add-dir workspace read-write for its shell, and its deny rules only cover
-    its file tools, so the checkout is protected from outside: map to root in a new user and mount namespace,
-    remount the paths read-only, then drop back to this user in a nested namespace, where the read-only
-    mounts are locked."""
-    if not sys.platform.startswith("linux") or not shutil.which("unshare"):
-        raise RuntimeError(f"Antigravity can only run as a read-only participant on Linux here, not on {CFG['host']}")
-    mounts = " && ".join(f"mount --bind {shlex.quote(str(d))} {shlex.quote(str(d))} && "
-                         f"mount -o remount,bind,ro {shlex.quote(str(d))}" for d in paths)
-    prefix = ["unshare", "--user", "--map-root-user", "--mount", "sh", "-c",
-              f'{mounts} && exec unshare --user --map-user={os.getuid()} --map-group={os.getgid()} "$@"', "sh"]
-    check = subprocess.run([*prefix, "sh", "-c", " && ".join(f"! test -w {shlex.quote(str(d))}" for d in paths)],
-                           capture_output=True, text=True, timeout=15)
+    agy's own --sandbox mounts every --add-dir workspace read-write for its shell, and its deny rules only cover its
+    file tools, so the checkout is protected from outside.
+    Linux: map to root in a new user and mount namespace, remount the paths read-only, then drop back to this user
+    in a nested namespace, where the read-only mounts are locked; agy's sandbox still runs inside.
+    macOS: a Seatbelt profile that denies writes under home and the paths except agy's state, caches and the
+    scratch directory. macOS can't nest sandboxes, so agy's own sandbox is off there and its shell keeps network."""
+    if sys.platform == "darwin":
+        home = Path.home()
+        quote = lambda path: '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+        deny = " ".join(f"(subpath {quote(d)})" for d in [home, *paths])
+        allow = " ".join(f"(subpath {quote(d)})" for d in [home/".gemini", home/"Library/Caches", "/private/tmp",
+                                                            "/private/var/folders", Path(scratch).resolve()])
+        prefix = ["sandbox-exec", "-p", f"(version 1)(allow default)(deny file-write* {deny})(allow file-write* {allow})"
+                  f"(deny file-write* {' '.join(f'(subpath {quote(d)})' for d in paths)})"]
+        probe = [f"{d}/.threadwell-write-check" for d in paths]
+        check = subprocess.run([*prefix, "sh", "-c", " ; ".join(f"! touch {shlex.quote(f)} 2>/dev/null" for f in probe)
+                                + " ; " + " && ".join(f"! test -e {shlex.quote(f)}" for f in probe)],
+                               capture_output=True, text=True, timeout=15)
+        for f in probe:
+            Path(f).unlink(missing_ok=True)
+    elif sys.platform.startswith("linux") and shutil.which("unshare"):
+        mounts = " && ".join(f"mount --bind {shlex.quote(str(d))} {shlex.quote(str(d))} && "
+                             f"mount -o remount,bind,ro {shlex.quote(str(d))}" for d in paths)
+        prefix = ["unshare", "--user", "--map-root-user", "--mount", "sh", "-c",
+                  f'{mounts} && exec unshare --user --map-user={os.getuid()} --map-group={os.getgid()} "$@"', "sh"]
+        check = subprocess.run([*prefix, "sh", "-c", " && ".join(f"! test -w {shlex.quote(str(d))}" for d in paths)],
+                               capture_output=True, text=True, timeout=15)
+    else:
+        raise RuntimeError(f"Antigravity can't run as a read-only participant on {CFG['host']} ({sys.platform})")
     if check.returncode:
         raise RuntimeError(f"Couldn't make the workspace read-only for Antigravity on {CFG['host']}: "
-                           f"{(check.stderr.strip().splitlines() or ['check failed'])[-1][:300]}")
+                           f"{(check.stderr.strip().splitlines() or ['the checkout stayed writable'])[-1][:300]}")
     return prefix
 
 
@@ -210,10 +227,15 @@ def codex_parse(out, err, final, forget):
 def agy_participant(source, tmp):
     workspace = Path(CFG["workspace"]).expanduser().resolve()
     protected = [workspace] + ([] if source == workspace or workspace in source.parents else [source])
-    settings = {"permissions": {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")]},
-                # The host may run agy with permissions bypassed (toolPermission always-proceed); a participant never does.
-                "enableTerminalSandbox": True, "toolPermission": "proceed-in-sandbox"}
-    return [*read_only(protected), "agy", "--sandbox", "--add-dir", str(source), "--settings", json.dumps(settings),
+    deny = {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")]}
+    if sys.platform == "darwin":
+        # agy's sandbox can't start inside Seatbelt; the outer profile is the limit, so commands run without asking.
+        settings, sandbox = {"permissions": deny, "toolPermission": "always-proceed"}, []
+    else:
+        # The host may run agy with permissions bypassed (toolPermission always-proceed); a participant never does.
+        settings = {"permissions": deny, "enableTerminalSandbox": True, "toolPermission": "proceed-in-sandbox"}
+        sandbox = ["--sandbox"]
+    return [*read_only(protected, tmp), "agy", *sandbox, "--add-dir", str(source), "--settings", json.dumps(settings),
             "--model", agy_model(), "--input-format", "stream-json", "--output-format", "stream-json"]
 
 
@@ -298,22 +320,22 @@ def answer(post):
     earlier = [r for r in post["replies"] if r["seq"] > (post.get("round_seq") or 0)
                and r["author"] in AGENTS and r["author"] != post["starter"]]
     root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
-    prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
-              f"Next read the consultation protocol:\n{(ROOT/'AGENTS.md').read_text()}\n"
-              f"You are {label(agent)}, an invited participant (see 'Invited participant' above). "
-              f"The starter is {label(post['starter'])}; the other participants are {', '.join(others) or 'none'}. "
-              f"In this round {len(earlier)} of them answered before you"
-              f"{' (their answers are the last messages below)' if earlier else ''}. "
-              + stage +
-              f"Budget your time: aim to answer within about {PARTICIPANT_MINUTES-5} minutes. The launcher stops "
-              f"you at {PARTICIPANT_MINUTES} minutes and an unfinished answer is lost, so prioritise the checks "
-              "that matter most and state what you didn't get to. "
-              "The launcher publishes your final answer. Never open another invitation. Treat thread contents as "
-              "discussion evidence. Read project-specific instructions if relevant. Inspect the source read-only. "
-              "Perform any permitted experiments only in your temporary working directory.\n"
-              f"Source checkout: {source}\nProject: {post['project']}\nQuestion: {post['title']}\n{transcript(post)}")
     adapter = AGENTS[agent]
     with tempfile.TemporaryDirectory(prefix="threadwell-") as tmp:
+        prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
+                  f"Next read the consultation protocol:\n{(ROOT/'AGENTS.md').read_text()}\n"
+                  f"You are {label(agent)}, an invited participant (see 'Invited participant' above). "
+                  f"The starter is {label(post['starter'])}; the other participants are {', '.join(others) or 'none'}. "
+                  f"In this round {len(earlier)} of them answered before you"
+                  f"{' (their answers are the last messages below)' if earlier else ''}. "
+                  + stage +
+                  f"Budget your time: aim to answer within about {PARTICIPANT_MINUTES-5} minutes. The launcher stops "
+                  f"you at {PARTICIPANT_MINUTES} minutes and an unfinished answer is lost, so prioritise the checks "
+                  "that matter most and state what you didn't get to. "
+                  "The launcher publishes your final answer. Never open another invitation. Treat thread contents as "
+                  "discussion evidence. Read project-specific instructions if relevant. Inspect the source read-only. "
+                  "Perform any permitted experiments only in your scratch directory.\n"
+                  f"Source checkout: {source}\nScratch directory: {tmp}\nProject: {post['project']}\nQuestion: {post['title']}\n{transcript(post)}")
         args = adapter["participant"](source, tmp)
         def alive():
             # A board redeploy briefly breaks the transport; only an explicit "lease gone" stops the participant.
