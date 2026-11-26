@@ -159,6 +159,7 @@ def project(db, name):
     return name
 
 
+PARTICIPANT_SWEEP = 1200  # a participant turn still running after 20 min (launcher limit: 15) is skipped
 HEARTBEAT = 30  # a poll refreshes "seen" once it is this old; the board shows a launcher online for 100 s
 
 
@@ -170,7 +171,7 @@ def heartbeat(db, host, now):
 def sweep(db, now):
     """Skip participants whose worker stopped pulsing, with a note that says so."""
     for pid, host, agent in db.execute("select id,host,agent from posts where phase='running' and started<?",
-                                       (now-960,)).fetchall():
+                                       (now-PARTICIPANT_SWEEP,)).fetchall():
         db.execute("insert into replies(post,author,body,stamp,kind) values(?,?,?,?,?)", (pid, "launcher",
                    f"{agent or 'The participant'} on {host} stopped responding, so its turn was skipped. "
                    f"Ask again to retry{' (--to ' + agent + ')' if agent else ''}.", now, f"skipped:{agent or ''}"))
@@ -185,7 +186,7 @@ def poll_due(db, host, now):
         exists(select 1 from posts where host=? and (phase='queued' or rework='queued'))
         or exists(select 1 from posts where (phase='running' and started<?) or (rework='running' and rework_seen<?))
         or not exists(select 1 from hosts where name=? and seen>?)""",
-        (host, now-960, now-150, host, now-HEARTBEAT)).fetchone()[0]
+        (host, now-PARTICIPANT_SWEEP, now-150, host, now-HEARTBEAT)).fetchone()[0]
 
 
 def claim_rework(db, host, now):
@@ -311,17 +312,19 @@ def dispatch(db, msg):
                     None if agent else f"skipped:{current}"))
         advance(db, pid, now)
         return pid
-    if op == "ask":
+    if op in {"ask", "propose"}:
+        # `propose` is the starter's intended decision, put to every participant for review before it can close.
         if post["phase"] not in {"answered", "failed"}:
             raise ValueError("A round is still running; wait for it to finish")
         invited = post["participants"]
-        queue = [a for a in agents(msg["to"], "to") if a in invited] if msg.get("to") else invited
+        queue = [a for a in agents(msg["to"], "to") if a in invited] if msg.get("to") and op == "ask" else invited
         if not queue:
             raise ValueError("None of those agents takes part in this thread: " + ", ".join(invited))
-        rounds = db.execute("select count(*) from replies where post=? and author=? and kind is null",
+        rounds = db.execute("select count(*) from replies where post=? and author=? and (kind is null or kind='proposal')",
                             (pid, post["starter"])).fetchone()[0]
-        seq = db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
-                         (pid, post["starter"], field(msg, "body"), now, model(msg), effort(msg))).lastrowid
+        seq = db.execute("insert into replies(post,author,body,stamp,model,effort,kind) values(?,?,?,?,?,?,?)",
+                         (pid, post["starter"], field(msg, "body"), now, model(msg), effort(msg),
+                          "proposal" if op == "propose" else None)).lastrowid
         start_round(db, pid, seq, round_order(pid, queue, rounds), now)
         return pid
     if op == "close":
@@ -331,6 +334,17 @@ def dispatch(db, msg):
                                  "); wait for it, or close with --force to record who never answered")
             db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
                        "Closed before " + ", ".join(post["pending"]) + " answered.", now))
+        # The participants review the starter's choice before it becomes the decision: a proposal must follow
+        # the opening question, or the owner's latest rework request.
+        anchor = max([r["seq"] for r in post["replies"] if r["author"] == post["starter"] and r["kind"] is None][:1] +
+                     [r["seq"] for r in post["replies"] if r["kind"] == "rework"])
+        reviewed = any(r["kind"] == "proposal" and r["seq"] > anchor for r in post["replies"])
+        if post["participants"] and not reviewed:
+            if not msg.get("force"):
+                raise ValueError("Post your intended decision with `threadwell propose` first, so the participants "
+                                 "can review it; or close with --force to record that they didn't")
+            db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
+                       "Closed without the participants reviewing the decision.", now))
         db.execute("""update posts set phase='done',updated=?,lease=null,pending=null,agent=null,decision=?,
                       decision_model=?,decision_effort=? where id=?""",
                    (now, field(msg, "body"), model(msg), effort(msg), pid))

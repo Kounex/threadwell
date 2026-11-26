@@ -43,7 +43,8 @@ with tempfile.TemporaryDirectory() as tmp:
             pass
     call("move",id=pid,project="Parsing")
     post=call("show",id=pid)
-    assert post["decision"]=="Keep the existing parser." and len(post["replies"])==4
+    assert post["decision"]=="Keep the existing parser." and len(post["replies"])==5
+    assert [r["body"] for r in post["replies"][-2:]]==["Closed before claude answered.","Closed without the participants reviewing the decision."]
     assert post["phase"]=="done" and post["project"]=="Parsing"
     with store.connect() as db:
         args=dict(q=["tokenizer"],project=["Parsing"],status=["done"])
@@ -54,9 +55,18 @@ with tempfile.TemporaryDirectory() as tmp:
     mid=call("open",id=str(uuid.uuid4()),project="General",starter="claude",host="test",title="Pick a cache",body="Compare",model="claude-opus-5-5")
     lease=claim("test")["lease"]
     call("reply",id=mid,lease=lease,body="Use LRU",model="gpt-5.6-terra")
+    try:
+        call("close",id=mid,body="LRU")
+        raise AssertionError("closed without the participants reviewing the decision")
+    except ValueError as exc:
+        assert "propose" in str(exc)
+    call("propose",id=mid,body="Decision: LRU, because ...",to=["nobody"])  # a proposal always goes to everyone
+    review=claim("test")
+    assert review["agent"]=="codex" and review["replies"][-1]["kind"]=="proposal"
+    call("reply",id=mid,lease=review["lease"],body="Agree",model="gpt-5.6-terra")
     call("close",id=mid,body="LRU",model="claude-opus-5-5",effort="high")
     post=call("show",id=mid)
-    assert [r["model"] for r in post["replies"]]==["claude-opus-5-5","gpt-5.6-terra"] and post["decision_model"]=="claude-opus-5-5" and post["decision_effort"]=="high"
+    assert [r["model"] for r in post["replies"]]==["claude-opus-5-5","gpt-5.6-terra",None,"gpt-5.6-terra"] and post["decision_model"]=="claude-opus-5-5" and post["decision_effort"]=="high"
 
     # Owner rework: only on closed threads, once at a time, keeps the old decision in the thread.
     try:
@@ -77,7 +87,7 @@ with tempfile.TemporaryDirectory() as tmp:
     run=call("claimrework",host="test")
     assert run["id"]==mid and call("claimrework",host="test") is None
     assert not call("reworkpulse",id=mid,lease="wrong") and call("reworkpulse",id=mid,lease=run["rework_lease"])
-    call("ask",id=mid,body="Would ARC fit?")
+    call("propose",id=mid,body="Switch to ARC?")  # after a rework request, the new choice is reviewed again
     peer=claim("test")
     call("reply",id=peer["id"],lease=peer["lease"],body="ARC fits",model="gpt-5.6-terra")
     call("close",id=mid,body="Switch to ARC",model="claude-opus-5-5")
@@ -133,7 +143,7 @@ with tempfile.TemporaryDirectory() as tmp:
     call("reworked",id=mid,lease=both["rework"]["rework_lease"],body="done")
     # A participant that stops pulsing loses its turn with a note saying so (here it was the only one).
     with store.connect() as db:
-        db.execute("update posts set started=started-1000 where id=?",(pid,))
+        db.execute("update posts set started=started-1300 where id=?",(pid,))
     call("poll",host="quiet")
     post=call("show",id=pid)
     assert post["phase"]=="failed" and "stopped responding" in post["replies"][-1]["body"] and not post["pending"]
@@ -189,7 +199,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert claim("trio") is None
     call("close",id=tid,body="A",force=True)
     post=call("show",id=tid)
-    assert post["phase"]=="done" and not post["pending"] and "Closed before" in post["replies"][-1]["body"]
+    assert post["phase"]=="done" and not post["pending"] and "Closed before" in post["replies"][-2]["body"]
     try:
         call("reply",id=tid,lease=turn["lease"],body="late")
         raise AssertionError("late reply accepted after a forced close")
@@ -204,7 +214,7 @@ with tempfile.TemporaryDirectory() as tmp:
     call("open",id=sid,project="General",starter="claude",host="slow",title="Sweep",body="b",participants=["codex","antigravity"])
     stuck=claim("slow")
     with store.connect() as db:
-        db.execute("update posts set started=started-1000 where id=?",(sid,))
+        db.execute("update posts set started=started-1300 where id=?",(sid,))
     nxt=claim("slow")
     post=call("show",id=sid)
     assert nxt["id"]==sid and nxt["agent"]!=stuck["agent"] and "stopped responding" in post["replies"][-1]["body"]

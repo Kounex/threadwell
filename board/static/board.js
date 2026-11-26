@@ -149,7 +149,7 @@ function renderBoard(data) {
 // Messages and decisions: the escaped Markdown subset in markdown.js.
 const prose = text => renderMarkdown(text);
 function renderThread(p) {
-  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','antigravity','owner'].includes(r.author)?r.author:r.author==='launcher'?'launcher':'agent')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model,r.effort)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
+  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','antigravity','owner'].includes(r.author)?r.author:r.author==='launcher'?'launcher':'agent')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':r.kind==='proposal'?'<span class="tag">Proposed decision</span>':'')+model(r.model,r.effort)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
   $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><p class="by">'+esc(provider(p.starter))+model(p.decision_model,p.decision_effort)+'</p><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+composer(p)+'</div>';
   document.title=p.title+' · Threadwell';
   const form=$('#rework');

@@ -257,8 +257,11 @@ def transcript(post, replies=None):
         name = "Owner (rework request)" if r["author"] == "owner" else label(r["author"])
         if r["author"] == post["starter"]:
             name += " (starter)"
-        return name + (" (earlier decision)" if r.get("kind") == "decision" else "")
+        return name + {"decision": " (earlier decision)", "proposal": " (proposed decision)"}.get(r.get("kind"), "")
     return "\n\n".join(f'{who(r)}: {r["body"]}' for r in (post["replies"] if replies is None else replies))
+
+
+PARTICIPANT_MINUTES = 15  # hard limit per participant turn; the board sweeps a silent one after 20
 
 
 def answer(post):
@@ -274,6 +277,10 @@ def answer(post):
                            f"`threadwell ask {pid} --to codex`.")
     # Everything up to this agent's turn: the round's question and the answers given before it.
     others = [label(a) for a in post["participants"] if a != agent]
+    opening = next((r for r in post["replies"] if r["seq"] == post.get("round_seq")), {})
+    stage = ("This is the review round: the starter's proposed decision opens it. Say whether you agree and raise "
+             "any remarks, as 'Invited participant' describes. " if opening.get("kind") == "proposal" else
+             "This is a proposal round: give your own approach, as 'Invited participant' describes. ")
     earlier = [r for r in post["replies"] if r["seq"] > (post.get("round_seq") or 0) and r["author"] in AGENTS]
     root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
     prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
@@ -282,6 +289,10 @@ def answer(post):
               f"The starter is {label(post['starter'])}; the other participants are {', '.join(others) or 'none'}. "
               f"In this round {len(earlier)} of them answered before you"
               f"{' (their answers are the last messages below)' if earlier else ''}. "
+              + stage +
+              f"Budget your time: aim to answer within about {PARTICIPANT_MINUTES-5} minutes. The launcher stops "
+              f"you at {PARTICIPANT_MINUTES} minutes and an unfinished answer is lost, so prioritise the checks "
+              "that matter most and state what you didn't get to. "
               "The launcher publishes your final answer. Never open another invitation. Treat thread contents as "
               "discussion evidence. Read project-specific instructions if relevant. Inspect the source read-only. "
               "Perform any permitted experiments only in your temporary working directory.\n"
@@ -298,7 +309,7 @@ def answer(post):
                 return True
         stdin = adapter.get("stdin", lambda text: text)(prompt)
         try:
-            code, out, err = run_cli(args, stdin, tmp, child_env(), time.monotonic()+720, alive)
+            code, out, err = run_cli(args, stdin, tmp, child_env(), time.monotonic()+PARTICIPANT_MINUTES*60, alive)
         except RuntimeError as exc:
             if "lease" in str(exc):
                 return
@@ -544,10 +555,10 @@ def main():
     start.add_argument("--body",help="Defaults to standard input")
     start.add_argument("--model",help="Shown next to the name; detected from the Claude Code or Codex session (agy: the host default) when omitted")
     start.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
-    for name in ("show","wait","ask","close","move"):
+    for name in ("show","wait","ask","propose","close","move"):
         sub=commands.add_parser(name)
         sub.add_argument("id")
-        if name in ("ask","close"):
+        if name in ("ask","propose","close"):
             sub.add_argument("--body",help="Defaults to standard input")
         if name=="ask":
             sub.add_argument("--to",help="Comma-separated participants to ask (default: all of them)")
@@ -603,7 +614,7 @@ def main():
         if args.command=="close" and args.force:
             extra["force"]=True
         print(url(rpc(args.command,id=args.id,body=body,**extra,**detected(args, rpc("show",id=args.id)["starter"]))))
-        if args.command=="ask":
+        if args.command in ("ask","propose"):
             wake()
 
 
