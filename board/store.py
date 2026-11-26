@@ -8,7 +8,9 @@ import time
 import uuid
 
 DB = os.environ.get("THREADWELL_DB", "/data/threads.sqlite3")
-PROVIDERS = {"codex": "claude", "claude": "codex"}
+# Before multi-agent threads every post had exactly one peer: the other of these two.
+LEGACY_PEER = {"codex": "claude", "claude": "codex"}
+AGENT = re.compile(r"[a-z][a-z0-9-]{1,30}")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects(name TEXT PRIMARY KEY);
 INSERT OR IGNORE INTO projects VALUES('General');
@@ -17,7 +19,8 @@ CREATE TABLE IF NOT EXISTS posts(
  title TEXT NOT NULL, starter TEXT NOT NULL, host TEXT NOT NULL,
  phase TEXT NOT NULL, updated INTEGER NOT NULL, decision TEXT NOT NULL DEFAULT '',
  lease TEXT, started INTEGER, decision_model TEXT, decision_effort TEXT,
- rework TEXT, rework_lease TEXT, rework_seen INTEGER);
+ rework TEXT, rework_lease TEXT, rework_seen INTEGER,
+ participants TEXT, pending TEXT, agent TEXT, round_seq INTEGER);
 CREATE TABLE IF NOT EXISTS replies(
  seq INTEGER PRIMARY KEY, post TEXT REFERENCES posts(id), author TEXT, body TEXT, stamp INTEGER, model TEXT, kind TEXT, effort TEXT);
 CREATE INDEX IF NOT EXISTS reply_post ON replies(post,seq);
@@ -38,7 +41,8 @@ def initialize():
         db.executescript(SCHEMA)
         # Columns added after the first release; CREATE TABLE IF NOT EXISTS leaves existing tables alone.
         added = (("posts", "decision_model"), ("posts", "decision_effort"), ("posts", "rework"), ("posts", "rework_lease"),
-                 ("posts", "rework_seen"), ("replies", "model"), ("replies", "kind"), ("replies", "effort"))
+                 ("posts", "rework_seen"), ("posts", "participants"), ("posts", "pending"), ("posts", "agent"),
+                 ("posts", "round_seq"), ("replies", "model"), ("replies", "kind"), ("replies", "effort"))
         for table, column in added:
             if column not in {r[1] for r in db.execute(f"pragma table_info({table})")}:
                 db.execute(f"alter table {table} add column {column} TEXT")
@@ -50,8 +54,55 @@ def thread(db, pid):
         raise ValueError("Post not found")
     result = dict(row)
     result["replies"] = [dict(r) for r in db.execute(
-        "select author,body,stamp,model,effort,kind from replies where post=? order by seq", (pid,))]
+        "select seq,author,body,stamp,model,effort,kind from replies where post=? order by seq", (pid,))]
+    result["participants"] = participants(result)
+    result["pending"] = (result["pending"] or "").split(",") if result["pending"] else []
+    # The current (or last) round: who answered, whose turn was skipped, who is still due.
+    this_round = [r for r in result["replies"] if r["seq"] > (result["round_seq"] or 0)]
+    result["round"] = {"answered": [r["author"] for r in this_round if r["author"] not in ("launcher", "owner")],
+                       "skipped": [r["kind"][8:] for r in this_round if (r["kind"] or "").startswith("skipped:")],
+                       "pending": result["pending"]}
     return result
+
+
+def participants(post):
+    """Agents invited to every round: stored since multi-agent threads, otherwise the starter's legacy peer."""
+    if post["participants"]:
+        return post["participants"].split(",")
+    return [LEGACY_PEER[post["starter"]]] if post["starter"] in LEGACY_PEER else []
+
+
+def agents(value, field_name):
+    """A list of agent names: lowercase identifiers, duplicates dropped, order kept."""
+    if not isinstance(value, list) or not value or len(value) > 8 or \
+            not all(isinstance(a, str) and AGENT.fullmatch(a) for a in value):
+        raise ValueError(f"Invalid {field_name}: give one or more agent names")
+    return list(dict.fromkeys(value))
+
+
+def round_order(pid, names, rounds):
+    """Who answers first rotates per thread and per round, so no agent always speaks before the others have."""
+    shift = (int(pid.replace("-", "")[:8], 16) + rounds) % len(names)
+    return names[shift:] + names[:shift]
+
+
+def start_round(db, pid, seq, queue, now):
+    db.execute("update posts set phase='queued',pending=?,agent=null,lease=null,round_seq=?,updated=? where id=?",
+               (",".join(queue), seq, now, pid))
+
+
+def advance(db, pid, now):
+    """The current agent is done (answered or failed): queue the next one, or end the round."""
+    post = db.execute("select pending,agent,round_seq from posts where id=?", (pid,)).fetchone()
+    queue = [a for a in (post["pending"] or "").split(",") if a and a != post["agent"]]
+    if queue:
+        phase = "queued"
+    else:
+        answered = db.execute("""select 1 from replies where post=? and seq>? and author not in ('launcher','owner')
+                                 limit 1""", (pid, post["round_seq"] or 0)).fetchone()
+        phase = "answered" if answered else "failed"
+    db.execute("update posts set phase=?,pending=?,agent=null,lease=null,started=null,updated=? where id=?",
+               (phase, ",".join(queue) or None, now, pid))
 
 
 def field(msg, key, limit=64000):
@@ -105,21 +156,22 @@ def project(db, name):
     return name
 
 
-HEARTBEAT = 30  # seconds between host "seen" writes; the board shows a launcher online for 100 s
+HEARTBEAT = 30  # a poll refreshes "seen" once it is this old; the board shows a launcher online for 100 s
 
 
 def heartbeat(db, host, now):
     db.execute("""insert into hosts values(?,?) on conflict(name) do update set seen=excluded.seen
-                  where seen<?""", (host, now, now-HEARTBEAT))
+                  where seen<=?""", (host, now, now-HEARTBEAT))
 
 
 def sweep(db, now):
-    """Fail invitations whose worker stopped pulsing, with a note that says so."""
-    for pid, host in db.execute("select id,host from posts where phase='running' and started<?", (now-960,)).fetchall():
-        db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
-                   f"The participant on {host} stopped responding, so this invitation was marked failed. "
-                   "Ask again to retry.", now))
-        db.execute("update posts set phase='failed',lease=null,updated=? where id=?", (now, pid))
+    """Skip participants whose worker stopped pulsing, with a note that says so."""
+    for pid, host, agent in db.execute("select id,host,agent from posts where phase='running' and started<?",
+                                       (now-960,)).fetchall():
+        db.execute("insert into replies(post,author,body,stamp,kind) values(?,?,?,?,?)", (pid, "launcher",
+                   f"{agent or 'The participant'} on {host} stopped responding, so its turn was skipped. "
+                   f"Ask again to retry{' (--to ' + agent + ')' if agent else ''}.", now, f"skipped:{agent or ''}"))
+        advance(db, pid, now)
     for (stale,) in db.execute("select id from posts where rework='running' and rework_seen<?", (now-150,)).fetchall():
         finish_rework(db, stale, now, "The rework run stopped responding. The previous decision stands.")
 
@@ -127,9 +179,9 @@ def sweep(db, now):
 def poll_due(db, host, now):
     """Read-only check of whether a poll has anything to write: work, a sweep or a heartbeat."""
     return db.execute("""select
-        exists(select 1 from posts where host=? and (phase in ('queued','signin') or rework='queued'))
+        exists(select 1 from posts where host=? and (phase='queued' or rework='queued'))
         or exists(select 1 from posts where (phase='running' and started<?) or (rework='running' and rework_seen<?))
-        or not exists(select 1 from hosts where name=? and seen>=?)""",
+        or not exists(select 1 from hosts where name=? and seen>?)""",
         (host, now-960, now-150, host, now-HEARTBEAT)).fetchone()[0]
 
 
@@ -144,12 +196,21 @@ def claim_rework(db, host, now):
 
 
 def claim(db, host, now):
-    row = db.execute("select id from posts where host=? and phase='queued' order by updated,id limit 1", (host,)).fetchone()
+    """The next queued post on this host, leased to the first agent still due in its round."""
+    if db.execute("select 1 from posts where host=? and phase='running'", (host,)).fetchone():
+        return None  # one participant at a time per host, even with a duplicate worker
+    # Oldest round first, so a round already under way finishes before a later thread starts.
+    row = db.execute("""select * from posts where host=? and phase='queued'
+                        order by coalesce(round_seq,0),updated,id limit 1""", (host,)).fetchone()
     if not row:
-        waiting = db.execute("select 1 from posts where host=? and phase='signin' limit 1", (host,)).fetchone()
-        return {"waiting_for": "codex"} if waiting else None
-    db.execute("update posts set phase='running',lease=?,started=? where id=?", (uuid.uuid4().hex, now, row[0]))
-    return thread(db, row[0])
+        return None
+    queue = (row["pending"] or "").split(",") if row["pending"] else participants(row)
+    if not queue:
+        db.execute("update posts set phase='failed',updated=? where id=?", (now, row["id"]))
+        return None
+    db.execute("update posts set phase='running',pending=?,agent=?,lease=?,started=? where id=?",
+               (",".join(queue), queue[0], uuid.uuid4().hex, now, row["id"]))
+    return thread(db, row["id"])
 
 
 READS = {"show", "poll"}
@@ -169,30 +230,27 @@ def dispatch(db, msg):
         db.execute("begin immediate")
         heartbeat(db, host, now)
         sweep(db, now)
-        result = {"rework": claim_rework(db, host, now)}
-        post = claim(db, host, now)
-        if post and post.get("waiting_for"):
-            result["waiting_for"] = post["waiting_for"]
-        elif post:
-            result["post"] = post
+        result = {"rework": claim_rework(db, host, now), "post": claim(db, host, now)}
         return {k: v for k, v in result.items() if v}
     if op == "project":
         return project(db, field(msg, "project", 80))
     if op == "open":
         pid = str(uuid.UUID(msg["id"]))
         starter = msg["starter"]
-        if starter not in PROVIDERS:
+        if not isinstance(starter, str) or not AGENT.fullmatch(starter):
             raise ValueError("Unknown provider")
+        invited = [a for a in agents(msg.get("participants") or [LEGACY_PEER.get(starter, "")], "participants")
+                   if a != starter]
+        if not invited:
+            raise ValueError("Invite at least one agent other than the starter")
         name = project(db, field(msg, "project", 80))
-        db.execute("insert into posts(id,project,title,starter,host,phase,updated) values(?,?,?,?,?,'queued',?)",
-                   (pid, name, field(msg, "title", 200), starter, field(msg, "host", 80), now))
-        db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
-                   (pid, starter, field(msg, "body"), now, model(msg), effort(msg)))
+        db.execute("""insert into posts(id,project,title,starter,host,phase,updated,participants)
+                      values(?,?,?,?,?,'queued',?,?)""",
+                   (pid, name, field(msg, "title", 200), starter, field(msg, "host", 80), now, ",".join(invited)))
+        seq = db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
+                         (pid, starter, field(msg, "body"), now, model(msg), effort(msg))).lastrowid
+        start_round(db, pid, seq, round_order(pid, invited, 0), now)
         return pid
-    if op == "authready":
-        db.execute("update posts set phase='queued',updated=? where host=? and phase='signin' and starter='claude'",
-                   (now, field(msg, "host", 80)))
-        return True
     if op == "claimrework":
         # Kept for workers older than `poll`.
         sweep(db, now)
@@ -207,14 +265,14 @@ def dispatch(db, msg):
         finish_rework(db, msg["id"], now, msg.get("body") or None)
         return True
     if op in {"claim", "pulse"}:
-        # `claim` is kept for workers older than `poll`.
         host = field(msg, "host", 80)
         heartbeat(db, host, now)
         sweep(db, now)
-        if op == "pulse":
-            return bool(db.execute("select 1 from posts where id=? and lease=? and phase='running'",
-                                   (msg["id"], msg["lease"])).fetchone())
-        return claim(db, host, now)
+        if op == "claim":
+            # Workers older than multi-agent threads would invite the wrong agent; they get no work until updated.
+            return None
+        return bool(db.execute("select 1 from posts where id=? and lease=? and phase='running'",
+                               (msg["id"], msg["lease"])).fetchone())
     pid = msg["id"]
     post = thread(db, pid)
     if op == "show":
@@ -238,26 +296,43 @@ def dispatch(db, msg):
         return pid
     if post["phase"] == "done":
         raise ValueError("This post is closed")
-    if op in {"reply", "failed", "signin"}:
+    if op in {"reply", "failed"}:
         if not post["lease"] or msg.get("lease") != post["lease"]:
             raise ValueError("Invitation expired")
-        author = PROVIDERS[post["starter"]] if op == "reply" else "launcher"
-        phase = {"reply": "answered", "failed": "failed", "signin": "signin"}[op]
-    elif op == "ask":
+        current = post["agent"] or LEGACY_PEER.get(post["starter"])
+        author = current if op == "reply" else "launcher"
+        agent = author != "launcher"
+        # A failed turn is a launcher note tagged with the agent it skipped.
+        db.execute("insert into replies(post,author,body,stamp,model,effort,kind) values(?,?,?,?,?,?,?)",
+                   (pid, author, field(msg, "body"), now, model(msg) if agent else None, effort(msg) if agent else None,
+                    None if agent else f"skipped:{current}"))
+        advance(db, pid, now)
+        return pid
+    if op == "ask":
         if post["phase"] not in {"answered", "failed"}:
-            raise ValueError("An invitation is already pending")
-        author, phase = post["starter"], "queued"
-    elif op == "close":
-        db.execute("update posts set phase='done',updated=?,lease=null,decision=?,decision_model=?,decision_effort=? where id=?",
+            raise ValueError("A round is still running; wait for it to finish")
+        invited = post["participants"]
+        queue = [a for a in agents(msg["to"], "to") if a in invited] if msg.get("to") else invited
+        if not queue:
+            raise ValueError("None of those agents takes part in this thread: " + ", ".join(invited))
+        rounds = db.execute("select count(*) from replies where post=? and author=? and kind is null",
+                            (pid, post["starter"])).fetchone()[0]
+        seq = db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
+                         (pid, post["starter"], field(msg, "body"), now, model(msg), effort(msg))).lastrowid
+        start_round(db, pid, seq, round_order(pid, queue, rounds), now)
+        return pid
+    if op == "close":
+        if post["phase"] in {"queued", "running"}:
+            if not msg.get("force"):
+                raise ValueError("A round is still running (waiting for " + ", ".join(post["pending"]) +
+                                 "); wait for it, or close with --force to record who never answered")
+            db.execute("insert into replies(post,author,body,stamp) values(?,?,?,?)", (pid, "launcher",
+                       "Closed before " + ", ".join(post["pending"]) + " answered.", now))
+        db.execute("""update posts set phase='done',updated=?,lease=null,pending=null,agent=null,decision=?,
+                      decision_model=?,decision_effort=? where id=?""",
                    (now, field(msg, "body"), model(msg), effort(msg), pid))
         return pid
-    else:
-        raise ValueError("Unknown command")
-    agent = author != "launcher"
-    db.execute("insert into replies(post,author,body,stamp,model,effort) values(?,?,?,?,?,?)",
-               (pid, author, field(msg, "body"), now, model(msg) if agent else None, effort(msg) if agent else None))
-    db.execute("update posts set updated=?,phase=?,lease=null where id=?", (now, phase, pid))
-    return pid
+    raise ValueError("Unknown command")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
 
@@ -17,6 +18,7 @@ p.add_argument("--url",required=True)
 p.add_argument("--native-updates",action="store_true",help="Run each native CLI updater at most daily on invitation")
 p.add_argument("--workspace",type=Path,default=home/"agent")
 p.add_argument("--rework",action="store_true",help="Allow owner rework requests to start full-permission starter sessions on this host")
+p.add_argument("--agents",help="Comma-separated agents this host invites (default: every supported CLI found on PATH: claude, codex, antigravity)")
 p.add_argument("--notify",help="Command run as CMD MESSAGE TITLE when an invitation fails or waits for sign-in, and when a rework run ends")
 p.add_argument("transport",nargs=argparse.REMAINDER,help="After --, the executable and argv for store.py RPC")
 args=p.parse_args()
@@ -27,11 +29,18 @@ config=home/".config/threadwell"
 config.mkdir(mode=0o700,parents=True,exist_ok=True)
 target_config=config/"config.json"
 settings=json.loads(target_config.read_text()) if target_config.exists() else {}
-settings.update(host=args.host,url=args.url,workspace=str(args.workspace),transport=cmd,
-    updates={peer:[peer,"update"] for peer in ("codex","claude")} if args.native_updates else {})
+binaries={"claude":"claude","codex":"codex","antigravity":"agy"}
+agents=args.agents.split(",") if args.agents else [a for a,b in binaries.items() if shutil.which(b)]
+if len(agents)<2:
+    p.error("a host needs at least two agent CLIs (found: "+(", ".join(agents) or "none")+")")
+settings.update(host=args.host,url=args.url,workspace=str(args.workspace),transport=cmd,agents=agents,
+    updates={a:[binaries[a],"update"] for a in agents} if args.native_updates else {})
+# Antigravity runs the host's chosen model; Gemini 4 Carbon High is the strongest tier on paid plans.
+settings["models"]={"antigravity":"gemini-4-carbon-high",**settings.get("models",{})}
 if args.rework:
-    settings["rework"]={"enabled":True,"timeout":1800,"claude_args":["--permission-mode","bypassPermissions"],
-        "codex_args":["--dangerously-bypass-approvals-and-sandbox"],"env":{},**{k:v for k,v in settings.get("rework",{}).items() if k!="enabled"}}
+    settings["rework"]={"enabled":True,"timeout":3600,"claude_args":["--permission-mode","bypassPermissions"],
+        "codex_args":["--dangerously-bypass-approvals-and-sandbox"],"antigravity_args":["--dangerously-skip-permissions"],
+        "env":{},**{k:v for k,v in settings.get("rework",{}).items() if k!="enabled"}}
 if args.notify:
     settings["notify"]=[args.notify]
 target_config.write_text(json.dumps(settings,indent=2))

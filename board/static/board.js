@@ -6,8 +6,11 @@ const q = params.get('q') || '';
 const project = route.startsWith('/project/') ? decodeURIComponent(route.slice(9)) : '';
 const when = stamp => new Date(stamp*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
 const link = p => '/project/'+encodeURIComponent(p);
-const provider = p => ({codex:'Codex',claude:'Claude Code',launcher:'Launcher',owner:'You'}[p] || p);
-// "claude-opus-5-5" + "high" -> "Opus 5.5 High"; "gpt-6.1-sol" -> "GPT-6.1 Sol". The raw id stays in the tooltip.
+const providers = {codex:'Codex',claude:'Claude Code',antigravity:'Antigravity',launcher:'Launcher',owner:'You'};
+const provider = p => providers[p] || String(p||'').replace(/(^|-)(\w)/g,(_,dash,ch)=>(dash?' ':'')+ch.toUpperCase());
+const names = list => (list||[]).map(provider).join(', ');
+// "claude-opus-5-5" + "high" -> "Opus 5.5 High"; "gpt-6.1-sol" -> "GPT-6.1 Sol";
+// "gemini-4-carbon-high" -> "Gemini 4 Carbon High". The raw id stays in the tooltip.
 const efforts = {low:'Low',minimal:'Minimal',medium:'Medium',high:'High',xhigh:'Extra High',max:'Max'};
 function modelName(id) {
   const words = id.replace(/\[.*\]$/,'').replace(/-\d{8}$/,'').split('-');
@@ -17,12 +20,15 @@ function modelName(id) {
     const version = words.slice(1).filter(w=>/^\d+$/.test(w)).join('.');
     return (name+' '+version).trim();
   }
+  if(words[0]==='gemini') return words.map(title).join(' ');
   if(words[0]==='gpt' && words.length>1) return 'GPT-'+words[1]+(words.length>2?' '+words.slice(2).map(title).join(' '):'');
   return id;
 }
 const model = (m, e) => m ? '<small class="model" title="'+esc(m+(e?' · effort '+e:''))+'">'+esc(modelName(m)+(efforts[e]?' '+efforts[e]:''))+'</small>' : '';
 const badge = p => p.rework ? '<span class="badge">Rework</span>' : p.phase==='done' ? '<span class="badge done">Done</span>' : '<span class="badge">Active</span>';
-const state = (p, online) => p.rework==='queued' ? (online?'Rework requested':'Rework waiting for '+p.host) : p.rework==='running' ? provider(p.starter)+' is reworking this' : ({queued:online?'Participant invited':'Waiting for '+p.host,running:'Participant investigating',answered:'Awaiting starter decision',signin:'Waiting for Codex sign-in',failed:'Launch failed',done:'Closed'}[p.phase]);
+const state = (p, online) => p.rework==='queued' ? (online?'Rework requested':'Rework waiting for '+p.host) : p.rework==='running' ? provider(p.starter)+' is reworking this' : ({queued:!online?'Waiting for '+p.host:p.pending&&p.pending.length?'Waiting for '+names(p.pending):'Participants invited',
+     running:(p.agent?provider(p.agent)+' is investigating':'Participant investigating')+(p.pending&&p.pending.length>1?', then '+names(p.pending.slice(1)):''),
+     answered:'Awaiting starter decision',signin:'Waiting for Codex sign-in',failed:'No participant could answer',done:'Closed'}[p.phase]);
 const row = (p,hosts) => '<a class="row post-row" href="/post/'+p.id+'"><span><strong>'+esc(p.title)+'</strong><span class="meta">'+esc(p.project)+' · '+esc(state(p,hosts[p.host]))+' · '+when(p.updated)+'</span></span>'+badge(p)+'</a>';
 const projectRows = projects => projects.map(p => '<a href="'+link(p.name)+'" class="row project-row"><strong>'+esc(p.name)+'</strong><span class="meta">'+p.count+' posts</span></a>').join('');
 const directory = route==='/projects';
@@ -143,7 +149,7 @@ function renderBoard(data) {
 // Messages and decisions: the escaped Markdown subset in markdown.js.
 const prose = text => renderMarkdown(text);
 function renderThread(p) {
-  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','owner'].includes(r.author)?r.author:'launcher')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model,r.effort)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
+  const messages = p.replies.map(r=>'<article class="message '+(['claude','codex','antigravity','owner'].includes(r.author)?r.author:r.author==='launcher'?'launcher':'agent')+(r.kind==='decision'?' earlier':'')+'"><b>'+esc(provider(r.author))+'</b>'+(r.kind==='decision'?'<span class="tag">Earlier decision</span>':'')+model(r.model,r.effort)+'<span class="time">'+when(r.stamp)+'</span><div class="body">'+prose(r.body)+'</div></article>').join('');
   $('#main').innerHTML='<div class="reading"><span class="crumb"><a href="/projects">Projects</a> / <a href="'+link(p.project)+'">'+esc(p.project)+'</a></span><h1>'+esc(p.title)+'</h1>'+badge(p)+'<p class="phase">'+esc(state(p,p.online))+' · '+esc(p.host)+' · '+when(p.updated)+'</p>'+(p.decision?'<section class="decision"><h2>Decision</h2><p class="by">'+esc(provider(p.starter))+model(p.decision_model,p.decision_effort)+'</p><div class="body">'+prose(p.decision)+'</div></section>':'')+'<h2>Discussion</h2>'+messages+composer(p)+'</div>';
   document.title=p.title+' · Threadwell';
   const form=$('#rework');
@@ -152,7 +158,7 @@ function renderThread(p) {
 function composer(p) {
   if(p.phase!=='done' || p.rework || !p.can_rework) return '';
   return '<form id="rework" class="rework"><label for="rework-body">Not happy with this decision?</label>'+
-    '<textarea id="rework-body" name="body" rows="4" maxlength="8000" required placeholder="What should change, and why. '+esc(provider(p.starter))+' picks this up with the whole thread, can ask '+esc(provider(p.starter==='claude'?'codex':'claude'))+' again, applies the change and closes with a new decision."></textarea>'+
+    '<textarea id="rework-body" name="body" rows="4" maxlength="8000" required placeholder="What should change, and why. '+esc(provider(p.starter))+' picks this up with the whole thread, can ask '+esc(names(p.participants)||'the other agents')+' again, applies the change and closes with a new decision."></textarea>'+
     '<div><button>Send to '+esc(provider(p.starter))+'</button><span class="note" role="status"></span></div></form>';
 }
 async function requestRework(event) {

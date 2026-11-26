@@ -69,6 +69,9 @@ def session_model(provider):
         pick = lambda d: d.get("type") == "turn_context" and d["payload"].get("model") and \
             (d["payload"]["model"], d["payload"].get("effort"))
         return (last_model(logs[-1], pick) if logs else None) or (None, None)
+    if provider == "antigravity":
+        # agy exposes no session id to the commands it runs; report the host's configured default.
+        return agy_model(), None
     return None, None
 
 
@@ -100,6 +103,138 @@ def codex_signed_in():
     return status.returncode == 0
 
 
+def child_env(extra=None):
+    """Environment for a CLI session started by the launcher."""
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    # UGOS gives every systemd service GODEBUG=tlskyber=0; Go 1.24+ binaries such as agy refuse to start with it.
+    debug = [item for item in env.get("GODEBUG", "").split(",") if item and not item.startswith("tlskyber=")]
+    if debug:
+        env["GODEBUG"] = ",".join(debug)
+    else:
+        env.pop("GODEBUG", None)
+    env.update(extra or {})
+    return env
+
+
+def agy_model():
+    return CFG.get("models", {}).get("antigravity") or "gemini-4-carbon-high"
+
+
+def agy_stdin(prompt):
+    # `agy -p` takes the prompt only as an argument (128 KiB at most); stream-json reads it from standard input.
+    return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
+
+def agy_result(out):
+    """(answer, model) from agy's stream-json events; raises unless the turn succeeded with an answer."""
+    used, result = None, None
+    for line in out.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("event") == "init":
+            used = (event.get("init") or {}).get("model") or used
+        elif event.get("event") == "result":
+            result = event.get("result") or {}
+    if not result:
+        raise RuntimeError("Antigravity ended without a result. Check the host launcher log and `agy` login.")
+    forget_agy(result.get("conversation_id"))
+    if result.get("status") != "SUCCESS" or not (result.get("response") or "").strip():
+        raise RuntimeError(f"Antigravity reported {result.get('status') or 'no status'}: "
+                           f"{(result.get('error') or 'empty answer')[:300]}")
+    return result["response"], used or agy_model()
+
+
+def forget_agy(conversation):
+    """Remove an invited agy session's local conversation, as the Claude path removes its session log."""
+    if not conversation or not all(c in "0123456789abcdef-" for c in conversation):
+        return
+    base = Path.home()/".gemini/antigravity-cli"
+    shutil.rmtree(base/"brain"/conversation, ignore_errors=True)
+    for path in (base/"conversations"/(conversation+".db"), base/"presence"/(conversation+".lock")):
+        path.unlink(missing_ok=True)
+
+
+def sandbox_ready():
+    """agy's Linux sandbox needs unprivileged user namespaces; without them --sandbox silently does nothing."""
+    if sys.platform == "darwin":
+        return True
+    probe = subprocess.run(["unshare", "--user", "--map-root-user", "true"], capture_output=True, timeout=15)
+    return probe.returncode == 0
+
+
+# How each CLI is invited, read and resumed. `participant` returns (argv, stdin); `parse` returns (answer, model, effort).
+def claude_participant(source, tmp):
+    tools = "Read,Grep,Glob"
+    sandbox = []
+    if sys.platform == "darwin" or (shutil.which("bwrap") and shutil.which("socat")):
+        tools += ",Bash"
+        policy = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+                  "autoAllowBashIfSandboxed": True, "filesystem": {"denyWrite": [str(source)]}}
+        sandbox = ["--settings", json.dumps({"sandbox": policy})]
+    # The session log is kept only long enough to read the effort level, then removed.
+    return ["claude","-p","--permission-mode","dontAsk","--tools",tools,"--allowedTools","Read,Grep,Glob",
+            "--strict-mcp-config","--add-dir",str(source),"--output-format","json", *sandbox]
+
+
+def claude_parse(out, err, final, forget):
+    response = json.loads(out)
+    if response.get("is_error"):
+        raise RuntimeError("Claude Code reported an error. Check its login and account access.")
+    used, level = claude_result_model(response, forget=forget)
+    return response.get("result", ""), used, level
+
+
+def codex_parse(out, err, final, forget):
+    used, level = codex_banner_model(err)
+    return (final.read_text() if final.exists() else ""), used, level
+
+
+def agy_participant(source, tmp):
+    if not sandbox_ready():
+        raise RuntimeError(f"Antigravity's sandbox isn't available on {CFG['host']} (no unprivileged user namespaces), "
+                           "so it can't run as a read-only participant here")
+    workspace = Path(CFG["workspace"]).expanduser().resolve()
+    settings = {"permissions": {"deny": [f"write_file({workspace}/)", f"write_file({source}/)"]},
+                "enableTerminalSandbox": True}
+    return ["agy","--sandbox","--add-dir",str(source),"--settings",json.dumps(settings),"--model",agy_model(),
+            "--input-format","stream-json","--output-format","stream-json"]
+
+
+def agy_parse(out, err, final, forget):
+    answer, used = agy_result(out)
+    return answer, used, None
+
+
+AGENTS = {
+    "claude": dict(label="Claude Code", binary="claude", participant=claude_participant, parse=claude_parse,
+                   rework=lambda extra, tmp: ["claude", "-p", *extra, "--output-format", "json"],
+                   rework_args=["--permission-mode", "bypassPermissions"]),
+    "codex": dict(label="Codex", binary="codex",
+                  participant=lambda source, tmp: ["codex","exec","--ephemeral","--skip-git-repo-check","--sandbox",
+                                                   "workspace-write","-c",'approval_policy="never"',"-o",
+                                                   str(Path(tmp)/"answer.txt"),"-"],
+                  parse=codex_parse,
+                  rework=lambda extra, tmp: ["codex", "exec", "--skip-git-repo-check", *extra, "-o", str(Path(tmp)/"answer.txt"), "-"],
+                  rework_args=["--dangerously-bypass-approvals-and-sandbox"]),
+    "antigravity": dict(label="Antigravity", binary="agy", participant=agy_participant, parse=agy_parse, stdin=agy_stdin,
+                        rework=lambda extra, tmp: ["agy", *extra, "--model", agy_model(),
+                                              "--input-format", "stream-json", "--output-format", "stream-json"],
+                        rework_args=["--dangerously-skip-permissions"]),
+}
+
+
+def label(agent):
+    return AGENTS.get(agent, {}).get("label") or {"launcher": "Launcher", "owner": "Owner"}.get(agent, agent)
+
+
+def host_agents():
+    """Agents this host can invite: configured by setup, otherwise every known CLI found on PATH."""
+    return CFG.get("agents") or [name for name, a in AGENTS.items() if shutil.which(a["binary"])]
+
+
 def prepare_cli(peer):
     # Use the host-selected update command. A failed refresh leaves the installed CLI usable.
     command = CFG.get("updates", {}).get(peer)
@@ -108,62 +243,52 @@ def prepare_cli(peer):
         stamp.touch()
         try:
             result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, timeout=70)
+                                    stderr=subprocess.DEVNULL, timeout=70, env=child_env())
             print(f"{peer} update check exited {result.returncode}", file=sys.stderr, flush=True)
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"{peer} update check: {exc}", file=sys.stderr, flush=True)
-    version = subprocess.check_output([peer, "--version"], text=True, timeout=15).strip()
-    return version
+    binary = AGENTS[peer]["binary"]
+    version = subprocess.check_output([binary, "--version"], text=True, timeout=15, env=child_env()).strip()
+    return f"{binary} {version}" if not version.startswith(binary) else version
 
 
-def transcript(post):
-    label = {"owner": "owner (rework request)"}
-    return "\n\n".join(f'{label.get(r["author"], r["author"])}{" (earlier decision)" if r.get("kind") == "decision" else ""}: {r["body"]}'
-                       for r in post["replies"])
+def transcript(post, replies=None):
+    def who(r):
+        name = "Owner (rework request)" if r["author"] == "owner" else label(r["author"])
+        if r["author"] == post["starter"]:
+            name += " (starter)"
+        return name + (" (earlier decision)" if r.get("kind") == "decision" else "")
+    return "\n\n".join(f'{who(r)}: {r["body"]}' for r in (post["replies"] if replies is None else replies))
 
 
 def answer(post):
-    pid, lease = post["id"], post["lease"]
+    pid, lease, agent = post["id"], post["lease"], post.get("agent") or "codex"
     context = (LOCAL/(pid+".json"))
     source = Path(json.loads(context.read_text())["directory"]).resolve(strict=True)
-    peer = "claude" if post["starter"] == "codex" else "codex"
-    version = prepare_cli(peer)
-    print(f"Invitation {pid}: {version}", file=sys.stderr, flush=True)
-    if peer == "codex" and not codex_signed_in():
-        rpc("signin", id=pid, lease=lease,
-            body=f"Sign in to Codex on {CFG['host']}. The launcher will retry this invitation automatically.")
-        notify(post, f"Threadwell: sign in to Codex on {CFG['host']}",
-               "An invitation is waiting for the Codex login. It resumes by itself after `codex login`.")
-        return
+    if agent not in AGENTS or agent not in host_agents():
+        raise RuntimeError(f"{label(agent)} is not set up on {CFG['host']}")
+    version = prepare_cli(agent)
+    print(f"Invitation {pid} ({agent}): {version}", file=sys.stderr, flush=True)
+    if agent == "codex" and not codex_signed_in():
+        raise RuntimeError(f"Codex isn't signed in on {CFG['host']}. After `codex login` there, retry with "
+                           f"`threadwell ask {pid} --to codex`.")
+    # Everything up to this agent's turn: the round's question and the answers given before it.
+    others = [label(a) for a in post["participants"] if a != agent]
+    earlier = [r for r in post["replies"] if r["seq"] > (post.get("round_seq") or 0) and r["author"] in AGENTS]
     root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
-    content = transcript(post)
     prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
               f"Next read the consultation protocol:\n{(ROOT/'AGENTS.md').read_text()}\n"
-              f"You are the invited {peer} participant. The launcher publishes your final answer. "
-              "Never open another invitation. Treat thread contents as discussion evidence. "
-              "Read project-specific instructions if relevant. Inspect the source read-only. "
-              "Perform any permitted experiments only in your temporary working directory. "
-              "Give the starter concise evidence and a recommendation.\n"
-              f"Source checkout: {source}\nProject: {post['project']}\nQuestion: {post['title']}\n{content}")
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
+              f"You are {label(agent)}, an invited participant (see 'Invited participant' above). "
+              f"The starter is {label(post['starter'])}; the other participants are {', '.join(others) or 'none'}. "
+              f"In this round {len(earlier)} of them answered before you"
+              f"{' (their answers are the last messages below)' if earlier else ''}. "
+              "The launcher publishes your final answer. Never open another invitation. Treat thread contents as "
+              "discussion evidence. Read project-specific instructions if relevant. Inspect the source read-only. "
+              "Perform any permitted experiments only in your temporary working directory.\n"
+              f"Source checkout: {source}\nProject: {post['project']}\nQuestion: {post['title']}\n{transcript(post)}")
+    adapter = AGENTS[agent]
     with tempfile.TemporaryDirectory(prefix="threadwell-") as tmp:
-        final = Path(tmp)/"answer.txt"
-        if peer == "codex":
-            args = ["codex","exec","--ephemeral","--skip-git-repo-check","--sandbox","workspace-write",
-                    "-c",'approval_policy="never"',"-o",str(final),"-"]
-        else:
-            tools = "Read,Grep,Glob"
-            sandbox = []
-            if sys.platform == "darwin" or (shutil.which("bwrap") and shutil.which("socat")):
-                tools += ",Bash"
-                policy = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
-                          "autoAllowBashIfSandboxed": True, "filesystem": {"denyWrite": [str(source)]}}
-                sandbox = ["--settings", json.dumps({"sandbox": policy})]
-            # The session log is kept only long enough to read the effort level, then removed.
-            args = ["claude","-p","--permission-mode","dontAsk",
-                    "--tools",tools,"--allowedTools","Read,Grep,Glob","--strict-mcp-config",
-                    "--add-dir",str(source),"--output-format","json", *sandbox]
+        args = adapter["participant"](source, tmp)
         def alive():
             # A board redeploy briefly breaks the transport; only an explicit "lease gone" stops the participant.
             try:
@@ -171,23 +296,20 @@ def answer(post):
             except Exception as exc:
                 print(f"Invitation {pid}: pulse failed: {exc}", file=sys.stderr, flush=True)
                 return True
+        stdin = adapter.get("stdin", lambda text: text)(prompt)
         try:
-            code, out, err = run_cli(args, prompt, tmp, env, time.monotonic()+720, alive)
+            code, out, err = run_cli(args, stdin, tmp, child_env(), time.monotonic()+720, alive)
         except RuntimeError as exc:
             if "lease" in str(exc):
                 return
-            raise RuntimeError("Participant timed out")
+            raise RuntimeError(f"{label(agent)} timed out")
         if code:
             # Preserve local diagnostics for the operator; keep CLI transcripts off the board.
             print(err[-1500:], file=sys.stderr, flush=True)
-            raise RuntimeError(f"{peer} exited with status {code}. Check the host launcher log and CLI login.")
-        if peer == "codex":
-            result, (used, level) = final.read_text(), codex_banner_model(err)
-        else:
-            response = json.loads(out)
-            if response.get("is_error"):
-                raise RuntimeError("Claude Code reported an error. Check its login and account access.")
-            result, (used, level) = response["result"], claude_result_model(response, forget=True)
+            if agent == "antigravity":
+                agy_result(out)  # raises with agy's own status and error when it reported one
+            raise RuntimeError(f"{label(agent)} exited with status {code}. Check the host launcher log and CLI login.")
+        result, used, level = adapter["parse"](out, err, Path(tmp)/"answer.txt", True)
     for attempt in range(6):
         try:
             return rpc("reply",id=pid,lease=lease,body=result.strip()[:64000],model=used,effort=level)
@@ -270,37 +392,31 @@ def rework(pid, lease):
         problem = checkout_problem(source) if source.is_dir() else f"{source} no longer exists"
         if problem:
             raise RuntimeError(problem)
+        if starter not in AGENTS:
+            raise RuntimeError(f"{starter} is not a CLI this launcher can resume")
         version = prepare_cli(starter)
         print(f"Rework {pid}: {version} in {source}", file=sys.stderr, flush=True)
         root_instructions = Path(CFG["workspace"]).expanduser()/"AGENTS.md"
         prompt = (f"First read these workspace instructions:\n{root_instructions.read_text()}\n"
                   f"Next read the Threadwell protocol:\n{(ROOT/'AGENTS.md').read_text()}\n"
-                  f"You are the {starter} starter of this thread, resumed unattended for a rework run (see 'Rework run' above). "
+                  f"You are {label(starter)}, the starter of this thread, resumed unattended for a rework run (see 'Rework run' above). "
+                  f"The other participants are {', '.join(label(a) for a in post['participants'])}. "
                   f"The owner questioned the decision; their request is the last message. "
                   f"Thread: {url(pid)} (id {pid})\nCheckout: {source}\nProject: {post['project']}\nQuestion: {post['title']}\n\n"
                   f"{transcript(post)}")
-        env = os.environ.copy()
-        env.pop("CLAUDECODE", None)
-        env.update({k: str(v) for k, v in (settings.get("env") or {}).items()})
+        adapter = AGENTS[starter]
+        env = child_env({k: str(v) for k, v in (settings.get("env") or {}).items()})
         env["THREADWELL_REWORK"] = pid
         with tempfile.TemporaryDirectory(prefix="threadwell-rework-") as tmp:
-            final = Path(tmp)/"answer.txt"
-            if starter == "codex":
-                args = ["codex", "exec", "--skip-git-repo-check", *settings.get("codex_args", []), "-o", str(final), "-"]
-            else:
-                args = ["claude", "-p", *settings.get("claude_args", []), "--output-format", "json"]
-            deadline = time.monotonic() + int(settings.get("timeout", 1800))
-            code, out, err = run_cli(args, prompt, str(source), env, deadline, alive)
+            extra = settings.get(f"{starter}_args", adapter["rework_args"])
+            args = adapter["rework"](extra, tmp)
+            deadline = time.monotonic() + int(settings.get("timeout", 3600))
+            stdin = adapter.get("stdin", lambda text: text)(prompt)
+            code, out, err = run_cli(args, stdin, str(source), env, deadline, alive)
             if code:
                 print(err[-1500:], file=sys.stderr, flush=True)
-                raise RuntimeError(f"{starter} exited with status {code}. Check the host launcher log.")
-            if starter == "codex":
-                result, (used, _) = (final.read_text() if final.exists() else ""), codex_banner_model(err)
-            else:
-                response = json.loads(out)
-                if response.get("is_error"):
-                    raise RuntimeError("Claude Code reported an error. Check its login and account access.")
-                result, used = response.get("result", ""), claude_result_model(response)[0]
+                raise RuntimeError(f"{label(starter)} exited with status {code}. Check the host launcher log.")
+            result, used, _ = adapter["parse"](out, err, Path(tmp)/"answer.txt", False)
         closed = retry(lambda: rpc("show", id=pid))["phase"] == "done"
         title = "Threadwell rework finished" if closed else "Threadwell rework ended without a decision"
         outcome = None if closed else ("The rework run ended without closing the thread, so the previous decision stands. "
@@ -379,9 +495,10 @@ def invite(post):
     try:
         answer(post)
     except Exception as exc:
-        reason = str(exc)[:1500] or "Launch failed"
+        agent = label(post.get("agent") or "participant")
+        reason = f"{agent} couldn't answer: {str(exc)[:1500] or 'launch failed'}"
         rpc("failed", id=post["id"], lease=post["lease"], body=reason)
-        notify(post, f"Threadwell invitation failed on {CFG['host']}", reason)
+        notify(post, f"Threadwell: {agent} failed on {CFG['host']}", reason)
 
 
 def worker():
@@ -399,9 +516,6 @@ def worker():
                     notify(work["rework"], "Threadwell rework failed", reason)
             if work.get("post"):
                 invite(work["post"])
-                busy = True
-            elif work.get("waiting_for") and codex_signed_in():
-                rpc("authready", host=CFG["host"])
                 busy = True
         except Exception as exc:
             print(str(exc), file=sys.stderr, flush=True)
@@ -423,17 +537,22 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     commands=parser.add_subparsers(dest="command",required=True)
     start=commands.add_parser("open")
-    start.add_argument("--as",dest="starter",choices=("claude","codex"),required=True)
+    start.add_argument("--as",dest="starter",choices=tuple(AGENTS),required=True)
+    start.add_argument("--with",dest="participants",help="Comma-separated agents to invite (default: every other agent on this host)")
     start.add_argument("--project",help="Defaults to the enclosing ~/agent project, otherwise General")
     start.add_argument("--title",required=True)
     start.add_argument("--body",help="Defaults to standard input")
-    start.add_argument("--model",help="Shown next to the name; detected from the Claude Code or Codex session when omitted")
+    start.add_argument("--model",help="Shown next to the name; detected from the Claude Code or Codex session (agy: the host default) when omitted")
     start.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
     for name in ("show","wait","ask","close","move"):
         sub=commands.add_parser(name)
         sub.add_argument("id")
         if name in ("ask","close"):
             sub.add_argument("--body",help="Defaults to standard input")
+        if name=="ask":
+            sub.add_argument("--to",help="Comma-separated participants to ask (default: all of them)")
+        if name=="close":
+            sub.add_argument("--force",action="store_true",help="Close while a round is still running; records who never answered")
             sub.add_argument("--model",help="Shown next to the name; detected from the session when omitted")
             sub.add_argument("--effort",help="Reasoning effort shown with the model; detected when omitted")
         if name=="move":
@@ -456,9 +575,12 @@ def main():
         source=Path.cwd()
         workspace=Path(CFG["workspace"]).expanduser()
         name=args.project or (source.relative_to(workspace).parts[0] if workspace in source.parents else "General")
+        invited=[a for a in (args.participants.split(",") if args.participants else host_agents()) if a.strip() and a!=args.starter]
+        if not invited:
+            raise RuntimeError(f"No other agent is set up on {CFG['host']} to invite")
         (LOCAL/(pid+".json")).write_text(json.dumps({"directory":str(source)}))
         rpc("open",id=pid,host=CFG["host"],starter=args.starter,project=name,title=args.title,body=args.body or sys.stdin.read(),
-            **detected(args, args.starter))
+            participants=[a.strip() for a in invited],**detected(args, args.starter))
         wake()
         print(url(pid))
     elif args.command=="wait":
@@ -475,7 +597,12 @@ def main():
         print(url(rpc("move",id=args.id,project=args.project)))
     else:
         body=args.body or sys.stdin.read()
-        print(url(rpc(args.command,id=args.id,body=body,**detected(args, rpc("show",id=args.id)["starter"]))))
+        extra={}
+        if args.command=="ask" and args.to:
+            extra["to"]=[a.strip() for a in args.to.split(",") if a.strip()]
+        if args.command=="close" and args.force:
+            extra["force"]=True
+        print(url(rpc(args.command,id=args.id,body=body,**extra,**detected(args, rpc("show",id=args.id)["starter"]))))
         if args.command=="ask":
             wake()
 
