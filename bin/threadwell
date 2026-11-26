@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -171,21 +172,27 @@ def read_only(paths, scratch):
     sandboxes, so agy's own sandbox is off there (any toolPermission but always-proceed would try to start it and
     fail) and its shell keeps network access."""
     if sys.platform == "darwin":
-        home, scratch = Path.home(), Path(scratch).resolve()
+        home, scratch, state = Path.home(), Path(scratch).resolve(), Path.home()/".gemini/antigravity-cli"
         quote = lambda path: '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
         tree = lambda *items: " ".join(f"(subpath {quote(i)})" for i in items)
         exact = lambda *items: " ".join(f"(literal {quote(i)})" for i in items)
-        # Reads: an allowlist under home (the workspace, agy's own state, shell and git config, caches), never the
-        # MCP config, so no MCP servers load. Writes: only agy's state, caches and the scratch directory.
-        reads = (tree(*paths, home/".gemini", home/".local/bin", home/".config/git", home/".config/shell",
-                      home/"Library/Caches", home/"Library/Preferences") + " " +
-                 exact(home, home/".zshenv", home/".zshrc", home/".zprofile", home/".gitconfig", home/".config", home/"Library"))
+        config = re.escape(str(home/".gemini/config"))
+        # Reads under home: the checkout, agy's CLI state and config, shell and git config. Never hook or MCP
+        # configs (no host hooks or MCP servers in a participant turn), nor anything else in ~/.gemini (browser
+        # profile, other credentials) or ~/Library.
+        reads = (tree(*paths, state, home/".gemini/config", home/".local/bin", home/".config/git", home/".config/shell") + " " +
+                 exact(home, home/".gemini", home/".gemini/AGENTS.md", home/".gemini/GEMINI.md", home/".zshenv",
+                       home/".zshrc", home/".zprofile", home/".gitconfig", home/".config", home/"Library"))
+        # Writes: agy's CLI state (minus what later runs would execute or obey) and the scratch directory.
+        writes = tree(state, scratch, Path(tempfile.gettempdir()).resolve())
+        frozen = exact(state/"settings.json") + " " + tree(state/"bin", state/"builtin", state/"updater")
         prefix = ["sandbox-exec", "-p", "(version 1)(allow default)"
                   f"(deny file-read* {tree(home)})(allow file-read* {reads})"
-                  f"(deny file-read* {exact(home/'.gemini/config/mcp_config.json')})"
-                  f"(deny file-write* {tree(home, *paths)})"
-                  f"(allow file-write* {tree(home/'.gemini', home/'Library/Caches', '/private/tmp', '/private/var/folders', scratch)})"
-                  f"(deny file-write* {tree(*paths)})"]
+                  f'(deny file-read* (regex #"^{config}(/.*)?/(mcp_config|hooks)\\.json$"))'
+                  f"(deny file-write* {tree(home, *paths, '/private/var/folders', '/private/tmp')})"
+                  f"(allow file-write* {writes})(deny file-write* {frozen} {tree(*paths)})"
+                  # No ssh-agent: macOS's launchd agent sockets, should the environment variable leak back in.
+                  '(deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/com\\.apple\\.launchd\\.[^/]+/Listeners$")))']
         # Probe with a unique name, and only clean up a file the probe itself created.
         probes = [Path(d)/f".threadwell-write-check-{uuid.uuid4().hex}" for d in paths]
         check = subprocess.run([*prefix, "sh", "-c", " ; ".join(f"touch {shlex.quote(str(f))} 2>/dev/null" for f in probes)
@@ -238,6 +245,8 @@ def codex_parse(out, err, final, forget):
 def agy_participant(source, tmp):
     workspace = Path(CFG["workspace"]).expanduser().resolve()
     protected = [workspace] + ([] if source == workspace or workspace in source.parents else [source])
+    if sys.platform == "darwin":
+        protected = [source]  # under Seatbelt this is also the read allowlist; the rest of home is unwritable anyway
     deny = {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")] + ["mcp(*)"]}
     if sys.platform == "darwin":
         # agy's sandbox can't start inside Seatbelt; the outer profile is the limit, so commands run without asking.
@@ -357,7 +366,9 @@ def answer(post):
                 return True
         stdin = adapter.get("stdin", lambda text: text)(prompt)
         try:
-            code, out, err = run_cli(args, stdin, tmp, child_env(), time.monotonic()+PARTICIPANT_MINUTES*60, alive)
+            env = child_env({"AGY_CLI_DISABLE_AUTO_UPDATE": "true", "TMPDIR": tmp, "XDG_CACHE_HOME": tmp})
+            env.pop("SSH_AUTH_SOCK", None)  # a participant never uses the host's SSH keys
+            code, out, err = run_cli(args, stdin, tmp, env, time.monotonic()+PARTICIPANT_MINUTES*60, alive)
         except RuntimeError as exc:
             if "lease" in str(exc):
                 return
