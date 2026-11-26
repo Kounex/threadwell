@@ -166,22 +166,33 @@ def read_only(paths, scratch):
     file tools, so the checkout is protected from outside.
     Linux: map to root in a new user and mount namespace, remount the paths read-only, then drop back to this user
     in a nested namespace, where the read-only mounts are locked; agy's sandbox still runs inside.
-    macOS: a Seatbelt profile that denies writes under home and the paths except agy's state, caches and the
-    scratch directory. macOS can't nest sandboxes, so agy's own sandbox is off there and its shell keeps network."""
+    macOS: a Seatbelt profile. Reads under home are limited to an allowlist (workspace, agy's state without its MCP
+    config, shell and git config, caches); writes to agy's state, caches and the scratch directory. macOS can't nest
+    sandboxes, so agy's own sandbox is off there (any toolPermission but always-proceed would try to start it and
+    fail) and its shell keeps network access."""
     if sys.platform == "darwin":
-        home = Path.home()
+        home, scratch = Path.home(), Path(scratch).resolve()
         quote = lambda path: '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
-        deny = " ".join(f"(subpath {quote(d)})" for d in [home, *paths])
-        allow = " ".join(f"(subpath {quote(d)})" for d in [home/".gemini", home/"Library/Caches", "/private/tmp",
-                                                            "/private/var/folders", Path(scratch).resolve()])
-        prefix = ["sandbox-exec", "-p", f"(version 1)(allow default)(deny file-write* {deny})(allow file-write* {allow})"
-                  f"(deny file-write* {' '.join(f'(subpath {quote(d)})' for d in paths)})"]
-        probe = [f"{d}/.threadwell-write-check" for d in paths]
-        check = subprocess.run([*prefix, "sh", "-c", " ; ".join(f"! touch {shlex.quote(f)} 2>/dev/null" for f in probe)
-                                + " ; " + " && ".join(f"! test -e {shlex.quote(f)}" for f in probe)],
+        tree = lambda *items: " ".join(f"(subpath {quote(i)})" for i in items)
+        exact = lambda *items: " ".join(f"(literal {quote(i)})" for i in items)
+        # Reads: an allowlist under home (the workspace, agy's own state, shell and git config, caches), never the
+        # MCP config, so no MCP servers load. Writes: only agy's state, caches and the scratch directory.
+        reads = (tree(*paths, home/".gemini", home/".local/bin", home/".config/git", home/".config/shell",
+                      home/"Library/Caches", home/"Library/Preferences") + " " +
+                 exact(home, home/".zshenv", home/".zshrc", home/".zprofile", home/".gitconfig", home/".config", home/"Library"))
+        prefix = ["sandbox-exec", "-p", "(version 1)(allow default)"
+                  f"(deny file-read* {tree(home)})(allow file-read* {reads})"
+                  f"(deny file-read* {exact(home/'.gemini/config/mcp_config.json')})"
+                  f"(deny file-write* {tree(home, *paths)})"
+                  f"(allow file-write* {tree(home/'.gemini', home/'Library/Caches', '/private/tmp', '/private/var/folders', scratch)})"
+                  f"(deny file-write* {tree(*paths)})"]
+        # Probe with a unique name, and only clean up a file the probe itself created.
+        probes = [Path(d)/f".threadwell-write-check-{uuid.uuid4().hex}" for d in paths]
+        check = subprocess.run([*prefix, "sh", "-c", " ; ".join(f"touch {shlex.quote(str(f))} 2>/dev/null" for f in probes)
+                                + " ; " + " && ".join(f"! test -e {shlex.quote(str(f))}" for f in probes)],
                                capture_output=True, text=True, timeout=15)
-        for f in probe:
-            Path(f).unlink(missing_ok=True)
+        for f in probes:
+            f.unlink(missing_ok=True)
     elif sys.platform.startswith("linux") and shutil.which("unshare"):
         mounts = " && ".join(f"mount --bind {shlex.quote(str(d))} {shlex.quote(str(d))} && "
                              f"mount -o remount,bind,ro {shlex.quote(str(d))}" for d in paths)
@@ -227,7 +238,7 @@ def codex_parse(out, err, final, forget):
 def agy_participant(source, tmp):
     workspace = Path(CFG["workspace"]).expanduser().resolve()
     protected = [workspace] + ([] if source == workspace or workspace in source.parents else [source])
-    deny = {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")]}
+    deny = {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")] + ["mcp(*)"]}
     if sys.platform == "darwin":
         # agy's sandbox can't start inside Seatbelt; the outer profile is the limit, so commands run without asking.
         settings, sandbox = {"permissions": deny, "toolPermission": "always-proceed"}, []
