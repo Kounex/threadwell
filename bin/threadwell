@@ -211,7 +211,8 @@ def agy_participant(source, tmp):
     workspace = Path(CFG["workspace"]).expanduser().resolve()
     protected = [workspace] + ([] if source == workspace or workspace in source.parents else [source])
     settings = {"permissions": {"deny": [f"{tool}({d}/)" for d in protected for tool in ("write_file", "edit_file")]},
-                "enableTerminalSandbox": True}
+                # The host may run agy with permissions bypassed (toolPermission always-proceed); a participant never does.
+                "enableTerminalSandbox": True, "toolPermission": "proceed-in-sandbox"}
     return [*read_only(protected), "agy", "--sandbox", "--add-dir", str(source), "--settings", json.dumps(settings),
             "--model", agy_model(), "--input-format", "stream-json", "--output-format", "stream-json"]
 
