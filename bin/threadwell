@@ -192,7 +192,7 @@ def read_only(paths, scratch):
                   f"(deny file-read* {tree(home)})(allow file-read* {reads})"
                   f'(deny file-read* (regex #"^{config}(/.*)?/(mcp_config|hooks)\\.json$"))'
                   # Writes: nothing outside the allowlist below (Homebrew's Python, which the worker runs, included).
-                  '(deny file-write* (subpath "/"))(allow file-write* (literal "/dev/null") (literal "/dev/tty") '
+                  '(deny file-write* (subpath "/"))(allow file-write* (literal "/dev/null") (literal "/dev/tty") (literal "/dev/ptmx") '
                   '(regex #"^/dev/(fd/|ttys|dtracehelper)"))'
                   f"(allow file-write* {writes})(deny file-write* {frozen} {tree(*paths)})"
                   # agy rewrites this two-line shim before every shell command, so nothing planted in it survives.
