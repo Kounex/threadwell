@@ -191,12 +191,16 @@ def read_only(paths, scratch):
         prefix = ["sandbox-exec", "-p", "(version 1)(allow default)"
                   f"(deny file-read* {tree(home)})(allow file-read* {reads})"
                   f'(deny file-read* (regex #"^{config}(/.*)?/(mcp_config|hooks)\\.json$"))'
-                  f"(deny file-write* {tree(home, *paths, '/private/var/folders', '/private/tmp')})"
+                  # Writes: nothing outside the allowlist below (Homebrew's Python, which the worker runs, included).
+                  '(deny file-write* (subpath "/"))(allow file-write* (literal "/dev/null") (literal "/dev/tty") '
+                  '(regex #"^/dev/(fd/|ttys|dtracehelper)"))'
                   f"(allow file-write* {writes})(deny file-write* {frozen} {tree(*paths)})"
                   # agy rewrites this two-line shim before every shell command, so nothing planted in it survives.
                   f"(allow file-write* {exact(state/'bin/agentapi')})"
                   # No ssh-agent: macOS's launchd agent sockets, should the environment variable leak back in.
-                  '(deny network-outbound (remote unix-socket (path-regex #"^/private/tmp/com\\.apple\\.launchd\\.[^/]+/Listeners$")))']
+                  # No local services (ssh-agent, the Podman API at /var/run/docker.sock, ...) except DNS resolution.
+                  '(deny network-outbound (remote unix-socket))'
+                  '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))']
         # Probe with a unique name, and only clean up a file the probe itself created.
         probes = [Path(d)/f".threadwell-write-check-{uuid.uuid4().hex}" for d in paths]
         check = subprocess.run([*prefix, "sh", "-c", " ; ".join(f"touch {shlex.quote(str(f))} 2>/dev/null" for f in probes)
